@@ -15,5 +15,14 @@ let package = Package(
             name: "tapcapture",
             path: "Sources/tapcapture"
         ),
+        .target(
+            name: "OpenAudioEngine",
+            path: "Sources/OpenAudioEngine"
+        ),
+        .executableTarget(
+            name: "openaudio",
+            dependencies: ["OpenAudioEngine"],
+            path: "Sources/openaudio"
+        ),
     ]
 )

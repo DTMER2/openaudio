@@ -61,9 +61,66 @@ openaudio/
 3. `swift run tapcapture --pid <PID> -o out.caf`（初回に TCC プロンプト）→ 再生確認、レベル誤差 ±0.5dB 以内。
 4. 24h 連続録音・ウォッチドッグ作動確認は長期テストとして別途（受け入れ基準 0(b) の残項目）。
 
+## Phase 1 — App エンジン
+
+対応要件: F-E1〜E5（バスは 1 本のみ）、F-C1〜C6 再利用 / NF-S1〜S3, NF-P1〜P5 / 受け入れ基準 Phase 1
+
+ステータス: Phase 0 完了後に着手。
+
+### 構成
+
+```
+Tools/Sources/
+├── OpenAudioEngine/    # ライブラリ（エンジン本体）
+└── openaudio/          # CLI（エンジン起動・メーター/ドリフト統計表示・検証用プローブ）
+```
+
+### 設計判断
+
+- **キャプチャ側は単一 private aggregate**（NF-S1）: default output（main）+ tap + 実入力デバイス（sub-device、drift 補正有効）。実入力のドリフトは CoreAudio の aggregate 内補正に任せ、App 側の非同期 SRC は「エンジン → 仮想デバイス」の 1 境界のみ（NF-S2）。
+- **クロック橋渡し**: キャプチャ IOProc（ハードウェアクロック）→ SPSC ブリッジリング → 仮想デバイス IOProc（driver クロック）。リング充填率を PI 制御器で監視し、可変比 SRC（キュービック補間。同一公称レートの ppm 級ドリフト補正用途）の比を動的調整（NF-S3）。
+- **ミキサー**: ソース単位 gain/mute/pan をアトミックなパラメータスナップショットで RT スレッドへ伝達（NF-P2）。v1 スパイクはステレオバス 1 本 → 仮想デバイス ch0/1 へ書き込み。複数バス・ルーティング行列の一般化は Phase 2。
+- **メーター**: ソース／バスの peak・RMS を RT 外で vDSP 計算（NF-P3）、CLI が周期表示。
+- **録音**（F-E5）: バスミックスの CAF 書き出し（Phase 0(b) の writer 方式を踏襲）。
+- Phase 0(b) の無音ウォッチドッグ・減衰補正・デバイス切替再構築をエンジンへ移植（tapcapture 自体は独立スパイクとして温存）。
+
+### 既知の注意点（実測で確認）
+
+- tap はマスター音量適用**前**の音を捕捉する（ミュート中でもフルレベルで録れる）。
+- **デフォルト出力を OpenAudio 16ch 自身にしてはならない**: ソースの直接レンダリングとエンジン経由の書き込みが二重化し、クリップ・コムフィルタを起こす（減衰補正も 16ch=×8 に誤誘導される）。Phase 2/3 で「default output == 自デバイス」の検知・警告（または自動除外）を入れること。
+
+### 検証手順
+
+1. `swift run openaudio run --tap-system` + 別プロセスで仮想デバイス input を録音 → 実音声がエンドツーエンドで到達すること。
+2. ドリフト統計（リング充填率・SRC 比 ppm）が収束・安定すること。
+3. 受け入れ基準: 「Spotify → 本アプリ → 仮想デバイス → QuickTime」で 10 分間クリックノイズ・ドリフト破綻ゼロ（手動長期試験）。
+
+## Phase 2 — 制御プレーン・複数バス
+
+対応要件: F-D4, F-D6, F-E1（行列の一般化）/ §8 / 受け入れ基準 Phase 2「App から複数バスを動的に生成・ルーティング変更でき、音声スレッドにグリッチが出ない」
+
+### 制御プレーン ABI（契約 — `Driver/Source/OpenAudioControl.h` が正）
+
+- プラグインオブジェクトの解決: `kAudioHardwarePropertyTranslateBundleIDToPlugInObject`（"com.openaudio.driver"）。
+- カスタムプロパティ `'OAdc'`（プラグインオブジェクト・global scope・main element、UInt32、settable）: publish するループバックデバイス数（1〜8）。
+  - Set 時: driver がデバイスを生成/破棄し、`PropertiesChanged(kAudioPlugInPropertyDeviceList)` で host に通知。既存デバイスの IO は途切れない（デバイスごとに独立リング）。
+  - host storage（`WriteToStorage`）で永続化し、coreaudiod 再起動後も維持。
+- デバイス命名: #1 は既存互換（UID "OpenAudioDevice-1"、名前 "OpenAudio 16ch"）。#n (n≥2) は UID "OpenAudioDevice-n"、名前 "OpenAudio 16ch n"。
+- ルーティング行列は App-as-mixer 原則（§4.2）どおり **App 側に保持**（driver へは押さない。F-D6 の「チャンネルマップ/ルーティング受領」は driver-as-mixer に転じる場合の将来拡張とする）。
+
+### エンジン側
+
+- ルーティング行列: ソース × バス の有効フラグ（アトミックスナップショット、NF-P2）。バスごとに capture コールバック内で合算。
+- バス = ClockBridge + 仮想デバイス consumer IOProc の組。実行中に off-RT で生成・破棄し、アトミックなポインタ公開で RT へ渡す（グリッチなし）。
+- CLI `openaudio run` に `--buses N` / `--route <src>=<bus,...>` を追加し、さらに stdin の対話コマンド（`buses` / `route` / `gain` / `pan` / `mute` / `stats`）で実行中の動的変更を検証可能にする。
+
+### 検証手順
+
+1. 新ドライバ再インストール（要 sudo）後、`'OAdc'`=3 で Audio MIDI Setup に 3 デバイス出現、=1 に戻して消えること。
+2. `openaudio run --tap-system --buses 2` で各バスを `probe-vdev` し、ルーティングどおりの音が録れること。
+3. 実行中に route/バス数を変更してアンダーラン・グリッチが出ないこと（統計で確認）。
+
 ## 以降のフェーズ（本計画のスコープ外）
 
-- Phase 1: App エンジン（ミキサー + SRC/PI ドリフト補正）
-- Phase 2: 制御プレーン（カスタム HAL プロパティ、複数バス）
-- Phase 3: SwiftUI UI（ノードグラフ、メーター、メニューバー常駐）
+- Phase 3: SwiftUI UI（ノードグラフ、メーター、ソース別 gain、モニタリング、メニューバー常駐）
 - Phase 4: 署名・notarization・インストーラ

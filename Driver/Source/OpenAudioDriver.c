@@ -1,13 +1,21 @@
 /*
  * OpenAudioDriver.c
  *
- * OpenAudio 16-channel loopback virtual audio device.
+ * OpenAudio 16-channel loopback virtual audio device(s).
  *
  * A minimal but complete AudioServerPlugIn (Core Audio HAL plugin) that
- * publishes a single virtual device presenting 16 input and 16 output
- * channels of native-packed Float32 PCM. Samples written to the output
- * stream are pushed into a lock-free ring buffer and returned on the input
- * stream, forming a bit-exact loopback bus.
+ * publishes between 1 and kOpenAudioMaxDevices (8) virtual devices, each
+ * presenting 16 input and 16 output channels of native-packed Float32 PCM.
+ * Samples written to a device's output stream are pushed into that device's
+ * lock-free ring buffer and returned on its input stream, forming a bit-exact
+ * loopback bus. Each device owns an independent ring, clock anchor, streams and
+ * volume/mute controls.
+ *
+ * The number of published devices is controlled at runtime through the custom
+ * plug-in property kOpenAudioPropertyDeviceCount ('OAdc', see
+ * OpenAudioControl.h). Changing it publishes/unpublishes devices, notifies the
+ * host and persists the value to host storage; devices that keep running are
+ * not disturbed.
  *
  * This file is an original implementation of the published
  * AudioServerPlugInDriverInterface. It follows the same COM-style plugin
@@ -16,10 +24,13 @@
  *
  * Realtime discipline: the IO entry points (GetZeroTimeStamp,
  * BeginIOOperation, DoIOOperation, EndIOOperation, WillDoIOOperation) perform
- * no allocation, no locking, no syscalls and touch no Objective-C. All memory
- * is allocated once at plugin load. State-change locking (a plain
- * pthread_mutex) is used ONLY outside the IO path.
+ * no allocation, no locking, no syscalls and touch no Objective-C. All ring
+ * memory is statically allocated (BSS) once at plugin load — never on the IO
+ * path. State-change locking (a plain pthread_mutex) is used ONLY outside the
+ * IO path.
  */
+
+#include "OpenAudioControl.h"
 
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -36,10 +47,7 @@
 
 #define kPlugIn_BundleID                "com.openaudio.driver"
 
-#define kDevice_Name                    "OpenAudio 16ch"
 #define kDevice_Manufacturer            "OpenAudio"
-#define kDevice_UID                     "OpenAudioDevice-1"
-#define kDevice_ModelUID                "OpenAudioDevice-Model-1"
 #define kBox_Name                       "OpenAudio Box"
 #define kBox_UID                        "OpenAudioBox-1"
 #define kBox_ModelUID                   "OpenAudioBox-Model-1"
@@ -62,6 +70,9 @@ enum
     kZeroTimestampPeriod        = 16384
 };
 
+/* Number of bytes in one device ring buffer. */
+#define kRingBufferBytes ((size_t)kRingBufferFrameSize * kNumberOfChannels * sizeof(Float32))
+
 /* Supported nominal sample rates. */
 static const Float64 kSupportedSampleRates[] = { 44100.0, 48000.0, 88200.0, 96000.0 };
 enum { kNumberOfSupportedSampleRates = 4 };
@@ -71,20 +82,56 @@ enum { kNumberOfSupportedSampleRates = 4 };
 #define kVolume_MinDB                   (-96.0f)
 #define kVolume_MaxDB                   (0.0f)
 
+/* Host storage key used to persist the published device count. */
+#define kStorageKey_DeviceCount         CFSTR("deviceCount")
+
 /* ======================================================================== */
 #pragma mark Object IDs
 /* ======================================================================== */
 
+/*
+ * Fixed objects:
+ *   kAudioObjectPlugInObject (== 1)  the plug-in object
+ *   2                                the box
+ *
+ * Per-device objects use a deterministic scheme so that IDs are unique within
+ * the plug-in and stable while published:
+ *
+ *   base(d) = kFirstDeviceObjectID + d * kObjectsPerDevice     (d is 0-based)
+ *   device      = base + 0
+ *   inStream    = base + 1
+ *   outStream   = base + 2
+ *   volControl  = base + 3
+ *   muteControl = base + 4
+ *
+ * Device #1 (d == 0) therefore occupies IDs 3..7, byte-identical to the Phase 0
+ * driver, so existing clients and looptest keep working.
+ */
 enum
 {
     kObjectID_PlugIn                    = kAudioObjectPlugInObject, /* == 1 */
     kObjectID_Box                       = 2,
-    kObjectID_Device                    = 3,
-    kObjectID_Stream_Input              = 4,
-    kObjectID_Stream_Output             = 5,
-    kObjectID_Volume_Output_Master      = 6,
-    kObjectID_Mute_Output_Master        = 7
+    kFirstDeviceObjectID                = 3,
+    kObjectsPerDevice                   = 5
 };
+
+static inline AudioObjectID OA_DeviceID(UInt32 d)    { return (AudioObjectID)(kFirstDeviceObjectID + d * kObjectsPerDevice + 0); }
+static inline AudioObjectID OA_InStreamID(UInt32 d)  { return (AudioObjectID)(kFirstDeviceObjectID + d * kObjectsPerDevice + 1); }
+static inline AudioObjectID OA_OutStreamID(UInt32 d) { return (AudioObjectID)(kFirstDeviceObjectID + d * kObjectsPerDevice + 2); }
+static inline AudioObjectID OA_VolID(UInt32 d)       { return (AudioObjectID)(kFirstDeviceObjectID + d * kObjectsPerDevice + 3); }
+static inline AudioObjectID OA_MuteID(UInt32 d)      { return (AudioObjectID)(kFirstDeviceObjectID + d * kObjectsPerDevice + 4); }
+
+typedef enum
+{
+    kObjectKind_Unknown = 0,
+    kObjectKind_PlugIn,
+    kObjectKind_Box,
+    kObjectKind_Device,
+    kObjectKind_StreamInput,
+    kObjectKind_StreamOutput,
+    kObjectKind_Volume,
+    kObjectKind_Mute
+} OAObjectKind;
 
 /* ======================================================================== */
 #pragma mark Global driver state
@@ -155,28 +202,131 @@ static pthread_mutex_t                      gStateMutex                         
 /* Box acquisition state. */
 static bool                                 gBox_Acquired                           = true;
 
-/* Device configuration state (guarded by gStateMutex for writers). */
-static Float64                              gDevice_SampleRate                      = kDefaultSampleRate;
-static UInt64                               gDevice_IORunningCount                  = 0;
-static bool                                 gStream_Input_Active                    = true;
-static bool                                 gStream_Output_Active                   = true;
+/* Per-device state. gDevices[d] is meaningful for d < gDeviceCount (published);
+   slots >= gDeviceCount are inactive but kept sane so re-publishing is clean. */
+typedef struct OADevice
+{
+    /* Configuration (guarded by gStateMutex for writers). */
+    Float64     sampleRate;
+    UInt64      ioRunningCount;
+    bool        inputStreamActive;
+    bool        outputStreamActive;
+    Float32     volumeValue;
+    bool        muteValue;
 
-/* Control state. */
-static Float32                              gVolume_Output_Master_Value             = 1.0f;
-static bool                                 gMute_Output_Master_Value               = false;
+    /* Clock anchor for GetZeroTimeStamp. Once IO is running these are written
+       only by that device's single IO thread. */
+    Float64     hostTicksPerFrame;
+    UInt64      anchorHostTime;
+    UInt64      numberTimeStamps;
 
-/* Ring buffer (interleaved Float32, [frame*channels + channel]). Allocated at
-   load time; the IO path only reads/writes it. */
-static Float32                              gRingBuffer[kRingBufferFrameSize * kNumberOfChannels];
+    /* Points at the statically-allocated ring for this slot; never reallocated
+       and never touched on the IO path except read/write of samples. */
+    Float32*    ring;
+} OADevice;
 
-/* Clock anchor for GetZeroTimeStamp. Written on the IO thread only. */
-static Float64                              gDevice_HostTicksPerFrame               = 0.0;
-static UInt64                               gDevice_AnchorHostTime                  = 0;
-static UInt64                               gDevice_NumberTimeStamps                = 0;
+static OADevice     gDevices[kOpenAudioMaxDevices];
+
+/* Ring buffers (interleaved Float32, [frame*channels + channel]). Statically
+   allocated at load time; the IO path only reads/writes them. */
+static Float32      gRingStorage[kOpenAudioMaxDevices][kRingBufferFrameSize * kNumberOfChannels];
+
+/* Number of currently-published devices, 1...kOpenAudioMaxDevices. Written only
+   under gStateMutex; read elsewhere as a single aligned word (benign race — any
+   observed value is a valid in-range bound). */
+static UInt32       gDeviceCount                                                    = 1;
 
 /* ======================================================================== */
 #pragma mark Small helpers
 /* ======================================================================== */
+
+static inline UInt32 OA_GetDeviceCount(void)
+{
+    /* Single aligned 32-bit read; see note on gDeviceCount. */
+    return gDeviceCount;
+}
+
+/* Initialize a device slot to defaults. Called under gStateMutex (or before any
+   IO thread exists, in Initialize). */
+static void OA_InitDeviceSlot(UInt32 d)
+{
+    OADevice* dev = &gDevices[d];
+    dev->sampleRate         = kDefaultSampleRate;
+    dev->ioRunningCount     = 0;
+    dev->inputStreamActive  = true;
+    dev->outputStreamActive = true;
+    dev->volumeValue        = 1.0f;
+    dev->muteValue          = false;
+    dev->hostTicksPerFrame  = 0.0;
+    dev->anchorHostTime     = 0;
+    dev->numberTimeStamps   = 0;
+    dev->ring               = gRingStorage[d];
+}
+
+/* Device identity strings. n is 1-based. Callers own the returned reference. */
+static CFStringRef OA_CopyDeviceUID(UInt32 n)
+{
+    return CFStringCreateWithFormat(NULL, NULL, CFSTR("OpenAudioDevice-%u"), (unsigned)n);
+}
+
+static CFStringRef OA_CopyDeviceModelUID(UInt32 n)
+{
+    return CFStringCreateWithFormat(NULL, NULL, CFSTR("OpenAudioDevice-Model-%u"), (unsigned)n);
+}
+
+static CFStringRef OA_CopyDeviceName(UInt32 n)
+{
+    /* Device 1 keeps the pre-Phase-2 name for compatibility. */
+    if(n <= 1)
+    {
+        return CFStringCreateWithFormat(NULL, NULL, CFSTR("OpenAudio 16ch"));
+    }
+    return CFStringCreateWithFormat(NULL, NULL, CFSTR("OpenAudio 16ch %u"), (unsigned)n);
+}
+
+static void OA_PersistDeviceCount(UInt32 count)
+{
+    if((gPlugIn_Host == NULL) || (gPlugIn_Host->WriteToStorage == NULL)) { return; }
+    SInt32 value = (SInt32)count;
+    CFNumberRef number = CFNumberCreate(NULL, kCFNumberSInt32Type, &value);
+    if(number != NULL)
+    {
+        gPlugIn_Host->WriteToStorage(gPlugIn_Host, kStorageKey_DeviceCount, number);
+        CFRelease(number);
+    }
+}
+
+/* Resolve an AudioObjectID to its kind. If requirePublished is true, per-device
+   objects belonging to slots >= gDeviceCount resolve to Unknown (they are not
+   published). IO-path callers pass false so that in-flight teardown of a
+   just-removed device is tolerated without consulting the state. */
+static OAObjectKind OA_Resolve(AudioObjectID inObjectID, bool requirePublished, UInt32* outDeviceIndex)
+{
+    if(outDeviceIndex != NULL) { *outDeviceIndex = 0; }
+
+    if(inObjectID == kObjectID_PlugIn) { return kObjectKind_PlugIn; }
+    if(inObjectID == kObjectID_Box)    { return kObjectKind_Box; }
+    if(inObjectID < (AudioObjectID)kFirstDeviceObjectID) { return kObjectKind_Unknown; }
+
+    UInt32 offset = (UInt32)inObjectID - (UInt32)kFirstDeviceObjectID;
+    UInt32 d      = offset / (UInt32)kObjectsPerDevice;
+    UInt32 role   = offset % (UInt32)kObjectsPerDevice;
+
+    if(d >= (UInt32)kOpenAudioMaxDevices) { return kObjectKind_Unknown; }
+    if(requirePublished && (d >= OA_GetDeviceCount())) { return kObjectKind_Unknown; }
+
+    if(outDeviceIndex != NULL) { *outDeviceIndex = d; }
+
+    switch(role)
+    {
+        case 0: return kObjectKind_Device;
+        case 1: return kObjectKind_StreamInput;
+        case 2: return kObjectKind_StreamOutput;
+        case 3: return kObjectKind_Volume;
+        case 4: return kObjectKind_Mute;
+        default: return kObjectKind_Unknown;
+    }
+}
 
 static inline Float32 OpenAudio_VolumeScalarToDB(Float32 inScalar)
 {
@@ -298,12 +448,39 @@ static OSStatus OpenAudio_Initialize(AudioServerPlugInDriverRef inDriver, AudioS
 
     gPlugIn_Host = inHost;
 
-    /* Ring buffer lives in BSS and is therefore already zero-initialized; make
-       the intent explicit and cover any hypothetical re-initialization. */
-    memset(gRingBuffer, 0, sizeof(gRingBuffer));
+    /* Restore the persisted device count (defaults to 1 when absent/invalid). */
+    UInt32 theCount = 1;
+    if((inHost != NULL) && (inHost->CopyFromStorage != NULL))
+    {
+        CFPropertyListRef theStored = NULL;
+        OSStatus theStatus = inHost->CopyFromStorage(inHost, kStorageKey_DeviceCount, &theStored);
+        if((theStatus == 0) && (theStored != NULL))
+        {
+            if(CFGetTypeID(theStored) == CFNumberGetTypeID())
+            {
+                SInt32 theValue = 0;
+                if(CFNumberGetValue((CFNumberRef)theStored, kCFNumberSInt32Type, &theValue))
+                {
+                    if((theValue >= 1) && (theValue <= kOpenAudioMaxDevices))
+                    {
+                        theCount = (UInt32)theValue;
+                    }
+                }
+            }
+            CFRelease(theStored);
+        }
+    }
 
-    gDevice_SampleRate = kDefaultSampleRate;
-    gDevice_IORunningCount = 0;
+    /* All slots start from a clean, sane state. Ring storage lives in BSS and is
+       therefore already zero-initialized; StartIO re-clears a device's ring on
+       its first client, so we do not touch the (possibly large) ring pages
+       here. */
+    for(UInt32 d = 0; d < (UInt32)kOpenAudioMaxDevices; ++d)
+    {
+        OA_InitDeviceSlot(d);
+    }
+
+    gDeviceCount = theCount;
     gBox_Acquired = true;
 
     return 0;
@@ -313,7 +490,8 @@ static OSStatus OpenAudio_CreateDevice(AudioServerPlugInDriverRef inDriver, CFDi
 {
     #pragma unused(inDescription, inClientInfo, outDeviceObjectID)
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
-    /* We publish a single static device; dynamic creation is not supported. */
+    /* Devices are published statically and controlled via kOpenAudioPropertyDeviceCount;
+       host-driven dynamic creation is not supported. */
     return kAudioHardwareUnsupportedOperationError;
 }
 
@@ -328,7 +506,7 @@ static OSStatus OpenAudio_AddDeviceClient(AudioServerPlugInDriverRef inDriver, A
 {
     #pragma unused(inClientInfo)
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
-    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+    if(OA_Resolve(inDeviceObjectID, true, NULL) != kObjectKind_Device) { return kAudioHardwareBadObjectError; }
     return 0;
 }
 
@@ -336,7 +514,8 @@ static OSStatus OpenAudio_RemoveDeviceClient(AudioServerPlugInDriverRef inDriver
 {
     #pragma unused(inClientInfo)
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
-    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+    /* Tolerate a device that has just been unpublished. */
+    if(OA_Resolve(inDeviceObjectID, false, NULL) != kObjectKind_Device) { return kAudioHardwareBadObjectError; }
     return 0;
 }
 
@@ -344,7 +523,9 @@ static OSStatus OpenAudio_PerformDeviceConfigurationChange(AudioServerPlugInDriv
 {
     #pragma unused(inChangeInfo)
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
-    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+
+    UInt32 d = 0;
+    if(OA_Resolve(inDeviceObjectID, false, &d) != kObjectKind_Device) { return kAudioHardwareBadObjectError; }
 
     /* The only configuration change we request is a sample-rate change, where
        inChangeAction carries the new rate. */
@@ -355,7 +536,7 @@ static OSStatus OpenAudio_PerformDeviceConfigurationChange(AudioServerPlugInDriv
     }
 
     pthread_mutex_lock(&gStateMutex);
-    gDevice_SampleRate = theNewRate;
+    gDevices[d].sampleRate = theNewRate;
     pthread_mutex_unlock(&gStateMutex);
 
     return 0;
@@ -365,7 +546,7 @@ static OSStatus OpenAudio_AbortDeviceConfigurationChange(AudioServerPlugInDriver
 {
     #pragma unused(inChangeAction, inChangeInfo)
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
-    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+    if(OA_Resolve(inDeviceObjectID, false, NULL) != kObjectKind_Device) { return kAudioHardwareBadObjectError; }
     return 0;
 }
 
@@ -388,6 +569,8 @@ static bool PlugIn_HasProperty(AudioObjectPropertySelector inSelector)
         case kAudioPlugInPropertyDeviceList:
         case kAudioPlugInPropertyTranslateUIDToDevice:
         case kAudioPlugInPropertyResourceBundle:
+        case kAudioObjectPropertyCustomPropertyInfoList:
+        case kOpenAudioPropertyDeviceCount:
             return true;
         default:
             return false;
@@ -532,16 +715,16 @@ static Boolean OpenAudio_HasProperty(AudioServerPlugInDriverRef inDriver, AudioO
     #pragma unused(inClientProcessID)
     if((inDriver != gAudioServerPlugInDriverRef) || (inAddress == NULL)) { return false; }
 
-    switch(inObjectID)
+    switch(OA_Resolve(inObjectID, true, NULL))
     {
-        case kObjectID_PlugIn:                   return PlugIn_HasProperty(inAddress->mSelector);
-        case kObjectID_Box:                      return Box_HasProperty(inAddress->mSelector);
-        case kObjectID_Device:                   return Device_HasProperty(inAddress->mSelector);
-        case kObjectID_Stream_Input:             return Stream_HasProperty(inAddress->mSelector);
-        case kObjectID_Stream_Output:            return Stream_HasProperty(inAddress->mSelector);
-        case kObjectID_Volume_Output_Master:     return Volume_HasProperty(inAddress->mSelector);
-        case kObjectID_Mute_Output_Master:       return Mute_HasProperty(inAddress->mSelector);
-        default:                                 return false;
+        case kObjectKind_PlugIn:        return PlugIn_HasProperty(inAddress->mSelector);
+        case kObjectKind_Box:           return Box_HasProperty(inAddress->mSelector);
+        case kObjectKind_Device:        return Device_HasProperty(inAddress->mSelector);
+        case kObjectKind_StreamInput:
+        case kObjectKind_StreamOutput:  return Stream_HasProperty(inAddress->mSelector);
+        case kObjectKind_Volume:        return Volume_HasProperty(inAddress->mSelector);
+        case kObjectKind_Mute:          return Mute_HasProperty(inAddress->mSelector);
+        default:                        return false;
     }
 }
 
@@ -563,31 +746,35 @@ static OSStatus OpenAudio_IsPropertySettable(AudioServerPlugInDriverRef inDriver
     }
 
     Boolean theSettable = false;
-    switch(inObjectID)
+    switch(OA_Resolve(inObjectID, true, NULL))
     {
-        case kObjectID_Box:
+        case kObjectKind_PlugIn:
+            theSettable = (inAddress->mSelector == kOpenAudioPropertyDeviceCount);
+            break;
+
+        case kObjectKind_Box:
             theSettable = (inAddress->mSelector == kAudioObjectPropertyName) ||
                           (inAddress->mSelector == kAudioObjectPropertyIdentify) ||
                           (inAddress->mSelector == kAudioBoxPropertyAcquired);
             break;
 
-        case kObjectID_Device:
+        case kObjectKind_Device:
             theSettable = (inAddress->mSelector == kAudioDevicePropertyNominalSampleRate);
             break;
 
-        case kObjectID_Stream_Input:
-        case kObjectID_Stream_Output:
+        case kObjectKind_StreamInput:
+        case kObjectKind_StreamOutput:
             theSettable = (inAddress->mSelector == kAudioStreamPropertyIsActive) ||
                           (inAddress->mSelector == kAudioStreamPropertyVirtualFormat) ||
                           (inAddress->mSelector == kAudioStreamPropertyPhysicalFormat);
             break;
 
-        case kObjectID_Volume_Output_Master:
+        case kObjectKind_Volume:
             theSettable = (inAddress->mSelector == kAudioLevelControlPropertyScalarValue) ||
                           (inAddress->mSelector == kAudioLevelControlPropertyDecibelValue);
             break;
 
-        case kObjectID_Mute_Output_Master:
+        case kObjectKind_Mute:
             theSettable = (inAddress->mSelector == kAudioBooleanControlPropertyValue);
             break;
 
@@ -611,27 +798,32 @@ static OSStatus OpenAudio_GetPropertyDataSize(AudioServerPlugInDriverRef inDrive
         return kAudioHardwareIllegalOperationError;
     }
 
-    switch(inObjectID)
+    UInt32 d = 0;
+    OAObjectKind theKind = OA_Resolve(inObjectID, true, &d);
+
+    switch(theKind)
     {
         /* ---- PlugIn ---- */
-        case kObjectID_PlugIn:
+        case kObjectKind_PlugIn:
             switch(inAddress->mSelector)
             {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:                     *outDataSize = sizeof(AudioClassID); return 0;
                 case kAudioObjectPropertyOwner:                     *outDataSize = sizeof(AudioObjectID); return 0;
                 case kAudioObjectPropertyManufacturer:              *outDataSize = sizeof(CFStringRef); return 0;
-                case kAudioObjectPropertyOwnedObjects:              *outDataSize = 2 * sizeof(AudioObjectID); return 0;
+                case kAudioObjectPropertyOwnedObjects:              *outDataSize = (1 + OA_GetDeviceCount()) * sizeof(AudioObjectID); return 0;
                 case kAudioPlugInPropertyBoxList:                   *outDataSize = 1 * sizeof(AudioObjectID); return 0;
                 case kAudioPlugInPropertyTranslateUIDToBox:         *outDataSize = sizeof(AudioObjectID); return 0;
-                case kAudioPlugInPropertyDeviceList:                *outDataSize = 1 * sizeof(AudioObjectID); return 0;
+                case kAudioPlugInPropertyDeviceList:                *outDataSize = OA_GetDeviceCount() * sizeof(AudioObjectID); return 0;
                 case kAudioPlugInPropertyTranslateUIDToDevice:      *outDataSize = sizeof(AudioObjectID); return 0;
                 case kAudioPlugInPropertyResourceBundle:            *outDataSize = sizeof(CFStringRef); return 0;
+                case kAudioObjectPropertyCustomPropertyInfoList:    *outDataSize = 1 * sizeof(AudioServerPlugInCustomPropertyInfo); return 0;
+                case kOpenAudioPropertyDeviceCount:                 *outDataSize = sizeof(CFPropertyListRef); return 0;
                 default:                                            return kAudioHardwareUnknownPropertyError;
             }
 
         /* ---- Box ---- */
-        case kObjectID_Box:
+        case kObjectKind_Box:
             switch(inAddress->mSelector)
             {
                 case kAudioObjectPropertyBaseClass:
@@ -652,12 +844,12 @@ static OSStatus OpenAudio_GetPropertyDataSize(AudioServerPlugInDriverRef inDrive
                 case kAudioBoxPropertyIsProtected:
                 case kAudioBoxPropertyAcquired:
                 case kAudioBoxPropertyAcquisitionFailed:            *outDataSize = sizeof(UInt32); return 0;
-                case kAudioBoxPropertyDeviceList:                   *outDataSize = (gBox_Acquired ? 1 : 0) * sizeof(AudioObjectID); return 0;
+                case kAudioBoxPropertyDeviceList:                   *outDataSize = (gBox_Acquired ? OA_GetDeviceCount() : 0) * sizeof(AudioObjectID); return 0;
                 default:                                            return kAudioHardwareUnknownPropertyError;
             }
 
         /* ---- Device ---- */
-        case kObjectID_Device:
+        case kObjectKind_Device:
             switch(inAddress->mSelector)
             {
                 case kAudioObjectPropertyBaseClass:
@@ -699,8 +891,8 @@ static OSStatus OpenAudio_GetPropertyDataSize(AudioServerPlugInDriverRef inDrive
             }
 
         /* ---- Streams ---- */
-        case kObjectID_Stream_Input:
-        case kObjectID_Stream_Output:
+        case kObjectKind_StreamInput:
+        case kObjectKind_StreamOutput:
             switch(inAddress->mSelector)
             {
                 case kAudioObjectPropertyBaseClass:
@@ -720,7 +912,7 @@ static OSStatus OpenAudio_GetPropertyDataSize(AudioServerPlugInDriverRef inDrive
             }
 
         /* ---- Volume control ---- */
-        case kObjectID_Volume_Output_Master:
+        case kObjectKind_Volume:
             switch(inAddress->mSelector)
             {
                 case kAudioObjectPropertyBaseClass:
@@ -738,7 +930,7 @@ static OSStatus OpenAudio_GetPropertyDataSize(AudioServerPlugInDriverRef inDrive
             }
 
         /* ---- Mute control ---- */
-        case kObjectID_Mute_Output_Master:
+        case kObjectKind_Mute:
             switch(inAddress->mSelector)
             {
                 case kAudioObjectPropertyBaseClass:
@@ -794,9 +986,13 @@ static OSStatus GetPlugInPropertyData(pid_t inClientProcessID, const AudioObject
 
         case kAudioObjectPropertyOwnedObjects:
         {
-            AudioObjectID theItems[2] = { kObjectID_Box, kObjectID_Device };
+            UInt32 theDeviceCount = OA_GetDeviceCount();
+            AudioObjectID theItems[1 + kOpenAudioMaxDevices];
+            theItems[0] = kObjectID_Box;
+            for(UInt32 i = 0; i < theDeviceCount; ++i) { theItems[1 + i] = OA_DeviceID(i); }
+            UInt32 theTotal = 1 + theDeviceCount;
             UInt32 theMax = inDataSize / sizeof(AudioObjectID);
-            UInt32 theCount = (theMax < 2) ? theMax : 2;
+            UInt32 theCount = (theMax < theTotal) ? theMax : theTotal;
             memcpy(outData, theItems, theCount * sizeof(AudioObjectID));
             *outDataSize = theCount * sizeof(AudioObjectID);
             return 0;
@@ -830,9 +1026,13 @@ static OSStatus GetPlugInPropertyData(pid_t inClientProcessID, const AudioObject
 
         case kAudioPlugInPropertyDeviceList:
         {
-            REQUIRE_SIZE(sizeof(AudioObjectID));
-            *((AudioObjectID*)outData) = kObjectID_Device;
-            *outDataSize = sizeof(AudioObjectID);
+            UInt32 theDeviceCount = OA_GetDeviceCount();
+            AudioObjectID theItems[kOpenAudioMaxDevices];
+            for(UInt32 i = 0; i < theDeviceCount; ++i) { theItems[i] = OA_DeviceID(i); }
+            UInt32 theMax = inDataSize / sizeof(AudioObjectID);
+            UInt32 theCount = (theMax < theDeviceCount) ? theMax : theDeviceCount;
+            memcpy(outData, theItems, theCount * sizeof(AudioObjectID));
+            *outDataSize = theCount * sizeof(AudioObjectID);
             return 0;
         }
 
@@ -845,9 +1045,19 @@ static OSStatus GetPlugInPropertyData(pid_t inClientProcessID, const AudioObject
             }
             CFStringRef theUID = *((CFStringRef*)inQualifierData);
             AudioObjectID theID = kAudioObjectUnknown;
-            if((theUID != NULL) && (CFStringCompare(theUID, CFSTR(kDevice_UID), 0) == kCFCompareEqualTo))
+            if(theUID != NULL)
             {
-                theID = kObjectID_Device;
+                UInt32 theDeviceCount = OA_GetDeviceCount();
+                for(UInt32 i = 0; i < theDeviceCount; ++i)
+                {
+                    CFStringRef theCandidate = OA_CopyDeviceUID(i + 1);
+                    if(theCandidate != NULL)
+                    {
+                        Boolean theMatch = (CFStringCompare(theUID, theCandidate, 0) == kCFCompareEqualTo);
+                        CFRelease(theCandidate);
+                        if(theMatch) { theID = OA_DeviceID(i); break; }
+                    }
+                }
             }
             *((AudioObjectID*)outData) = theID;
             *outDataSize = sizeof(AudioObjectID);
@@ -859,6 +1069,40 @@ static OSStatus GetPlugInPropertyData(pid_t inClientProcessID, const AudioObject
             *((CFStringRef*)outData) = CFSTR("");
             *outDataSize = sizeof(CFStringRef);
             return 0;
+
+        case kAudioObjectPropertyCustomPropertyInfoList:
+        {
+            /* Declare our custom properties so the host proxies them to HAL
+               clients. Only CFString/CFPropertyList-typed custom properties are
+               forwarded by coreaudiod, hence 'OAdc' is a CFPropertyList
+               (CFNumber). Honor the host-supplied buffer size: 0 entries when
+               it is too small. */
+            UInt32 theMax = inDataSize / (UInt32)sizeof(AudioServerPlugInCustomPropertyInfo);
+            UInt32 theCount = (theMax < 1) ? theMax : 1;
+            if(theCount > 0)
+            {
+                AudioServerPlugInCustomPropertyInfo* theInfo = (AudioServerPlugInCustomPropertyInfo*)outData;
+                theInfo[0].mSelector          = kOpenAudioPropertyDeviceCount;
+                theInfo[0].mPropertyDataType  = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
+                theInfo[0].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+            }
+            *outDataSize = theCount * (UInt32)sizeof(AudioServerPlugInCustomPropertyInfo);
+            return 0;
+        }
+
+        case kOpenAudioPropertyDeviceCount:
+        {
+            /* CFPropertyList-typed custom property: hand back a +1-retained
+               CFNumber that the host releases after marshalling it to the
+               client. */
+            REQUIRE_SIZE(sizeof(CFPropertyListRef));
+            pthread_mutex_lock(&gStateMutex);
+            SInt32 theCount = (SInt32)gDeviceCount;
+            pthread_mutex_unlock(&gStateMutex);
+            *((CFPropertyListRef*)outData) = CFNumberCreate(NULL, kCFNumberSInt32Type, &theCount);
+            *outDataSize = sizeof(CFPropertyListRef);
+            return 0;
+        }
 
         default:
             return kAudioHardwareUnknownPropertyError;
@@ -964,9 +1208,13 @@ static OSStatus GetBoxPropertyData(const AudioObjectPropertyAddress* inAddress, 
         {
             if(gBox_Acquired)
             {
-                REQUIRE_SIZE(sizeof(AudioObjectID));
-                *((AudioObjectID*)outData) = kObjectID_Device;
-                *outDataSize = sizeof(AudioObjectID);
+                UInt32 theDeviceCount = OA_GetDeviceCount();
+                AudioObjectID theItems[kOpenAudioMaxDevices];
+                for(UInt32 i = 0; i < theDeviceCount; ++i) { theItems[i] = OA_DeviceID(i); }
+                UInt32 theMax = inDataSize / sizeof(AudioObjectID);
+                UInt32 theCount = (theMax < theDeviceCount) ? theMax : theDeviceCount;
+                memcpy(outData, theItems, theCount * sizeof(AudioObjectID));
+                *outDataSize = theCount * sizeof(AudioObjectID);
             }
             else
             {
@@ -980,7 +1228,7 @@ static OSStatus GetBoxPropertyData(const AudioObjectPropertyAddress* inAddress, 
     }
 }
 
-static OSStatus GetDevicePropertyData(const AudioObjectPropertyAddress* inAddress, UInt32 inDataSize, UInt32* outDataSize, void* outData)
+static OSStatus GetDevicePropertyData(UInt32 inDeviceIndex, const AudioObjectPropertyAddress* inAddress, UInt32 inDataSize, UInt32* outDataSize, void* outData)
 {
     switch(inAddress->mSelector)
     {
@@ -1004,7 +1252,7 @@ static OSStatus GetDevicePropertyData(const AudioObjectPropertyAddress* inAddres
 
         case kAudioObjectPropertyName:
             REQUIRE_SIZE(sizeof(CFStringRef));
-            *((CFStringRef*)outData) = CFSTR(kDevice_Name);
+            *((CFStringRef*)outData) = OA_CopyDeviceName(inDeviceIndex + 1);
             *outDataSize = sizeof(CFStringRef);
             return 0;
 
@@ -1016,13 +1264,13 @@ static OSStatus GetDevicePropertyData(const AudioObjectPropertyAddress* inAddres
 
         case kAudioObjectPropertyModelName:
             REQUIRE_SIZE(sizeof(CFStringRef));
-            *((CFStringRef*)outData) = CFSTR(kDevice_Name);
+            *((CFStringRef*)outData) = OA_CopyDeviceName(inDeviceIndex + 1);
             *outDataSize = sizeof(CFStringRef);
             return 0;
 
         case kAudioObjectPropertyOwnedObjects:
         {
-            AudioObjectID theItems[4] = { kObjectID_Stream_Input, kObjectID_Stream_Output, kObjectID_Volume_Output_Master, kObjectID_Mute_Output_Master };
+            AudioObjectID theItems[4] = { OA_InStreamID(inDeviceIndex), OA_OutStreamID(inDeviceIndex), OA_VolID(inDeviceIndex), OA_MuteID(inDeviceIndex) };
             UInt32 theMax = inDataSize / sizeof(AudioObjectID);
             UInt32 theCount = (theMax < 4) ? theMax : 4;
             memcpy(outData, theItems, theCount * sizeof(AudioObjectID));
@@ -1038,13 +1286,13 @@ static OSStatus GetDevicePropertyData(const AudioObjectPropertyAddress* inAddres
 
         case kAudioDevicePropertyDeviceUID:
             REQUIRE_SIZE(sizeof(CFStringRef));
-            *((CFStringRef*)outData) = CFSTR(kDevice_UID);
+            *((CFStringRef*)outData) = OA_CopyDeviceUID(inDeviceIndex + 1);
             *outDataSize = sizeof(CFStringRef);
             return 0;
 
         case kAudioDevicePropertyModelUID:
             REQUIRE_SIZE(sizeof(CFStringRef));
-            *((CFStringRef*)outData) = CFSTR(kDevice_ModelUID);
+            *((CFStringRef*)outData) = OA_CopyDeviceModelUID(inDeviceIndex + 1);
             *outDataSize = sizeof(CFStringRef);
             return 0;
 
@@ -1062,7 +1310,7 @@ static OSStatus GetDevicePropertyData(const AudioObjectPropertyAddress* inAddres
 
         case kAudioDevicePropertyRelatedDevices:
             REQUIRE_SIZE(sizeof(AudioObjectID));
-            *((AudioObjectID*)outData) = kObjectID_Device;
+            *((AudioObjectID*)outData) = OA_DeviceID(inDeviceIndex);
             *outDataSize = sizeof(AudioObjectID);
             return 0;
 
@@ -1081,7 +1329,7 @@ static OSStatus GetDevicePropertyData(const AudioObjectPropertyAddress* inAddres
         case kAudioDevicePropertyDeviceIsRunning:
             REQUIRE_SIZE(sizeof(UInt32));
             pthread_mutex_lock(&gStateMutex);
-            *((UInt32*)outData) = (gDevice_IORunningCount > 0) ? 1 : 0;
+            *((UInt32*)outData) = (gDevices[inDeviceIndex].ioRunningCount > 0) ? 1 : 0;
             pthread_mutex_unlock(&gStateMutex);
             *outDataSize = sizeof(UInt32);
             return 0;
@@ -1105,11 +1353,11 @@ static OSStatus GetDevicePropertyData(const AudioObjectPropertyAddress* inAddres
             UInt32 theCount = 0;
             if((inAddress->mScope == kAudioObjectPropertyScopeGlobal) || (inAddress->mScope == kAudioObjectPropertyScopeInput))
             {
-                theItems[theCount++] = kObjectID_Stream_Input;
+                theItems[theCount++] = OA_InStreamID(inDeviceIndex);
             }
             if((inAddress->mScope == kAudioObjectPropertyScopeGlobal) || (inAddress->mScope == kAudioObjectPropertyScopeOutput))
             {
-                theItems[theCount++] = kObjectID_Stream_Output;
+                theItems[theCount++] = OA_OutStreamID(inDeviceIndex);
             }
             UInt32 theMax = inDataSize / sizeof(AudioObjectID);
             if(theCount > theMax) { theCount = theMax; }
@@ -1120,7 +1368,7 @@ static OSStatus GetDevicePropertyData(const AudioObjectPropertyAddress* inAddres
 
         case kAudioObjectPropertyControlList:
         {
-            AudioObjectID theItems[2] = { kObjectID_Volume_Output_Master, kObjectID_Mute_Output_Master };
+            AudioObjectID theItems[2] = { OA_VolID(inDeviceIndex), OA_MuteID(inDeviceIndex) };
             UInt32 theMax = inDataSize / sizeof(AudioObjectID);
             UInt32 theCount = (theMax < 2) ? theMax : 2;
             memcpy(outData, theItems, theCount * sizeof(AudioObjectID));
@@ -1137,7 +1385,7 @@ static OSStatus GetDevicePropertyData(const AudioObjectPropertyAddress* inAddres
         case kAudioDevicePropertyNominalSampleRate:
             REQUIRE_SIZE(sizeof(Float64));
             pthread_mutex_lock(&gStateMutex);
-            *((Float64*)outData) = gDevice_SampleRate;
+            *((Float64*)outData) = gDevices[inDeviceIndex].sampleRate;
             pthread_mutex_unlock(&gStateMutex);
             *outDataSize = sizeof(Float64);
             return 0;
@@ -1200,10 +1448,8 @@ static OSStatus GetDevicePropertyData(const AudioObjectPropertyAddress* inAddres
     }
 }
 
-static OSStatus GetStreamPropertyData(AudioObjectID inObjectID, const AudioObjectPropertyAddress* inAddress, UInt32 inDataSize, UInt32* outDataSize, void* outData)
+static OSStatus GetStreamPropertyData(UInt32 inDeviceIndex, bool inIsInput, const AudioObjectPropertyAddress* inAddress, UInt32 inDataSize, UInt32* outDataSize, void* outData)
 {
-    bool theIsInput = (inObjectID == kObjectID_Stream_Input);
-
     switch(inAddress->mSelector)
     {
         case kAudioObjectPropertyBaseClass:
@@ -1220,7 +1466,7 @@ static OSStatus GetStreamPropertyData(AudioObjectID inObjectID, const AudioObjec
 
         case kAudioObjectPropertyOwner:
             REQUIRE_SIZE(sizeof(AudioObjectID));
-            *((AudioObjectID*)outData) = kObjectID_Device;
+            *((AudioObjectID*)outData) = OA_DeviceID(inDeviceIndex);
             *outDataSize = sizeof(AudioObjectID);
             return 0;
 
@@ -1231,14 +1477,14 @@ static OSStatus GetStreamPropertyData(AudioObjectID inObjectID, const AudioObjec
         case kAudioStreamPropertyIsActive:
             REQUIRE_SIZE(sizeof(UInt32));
             pthread_mutex_lock(&gStateMutex);
-            *((UInt32*)outData) = (theIsInput ? gStream_Input_Active : gStream_Output_Active) ? 1 : 0;
+            *((UInt32*)outData) = (inIsInput ? gDevices[inDeviceIndex].inputStreamActive : gDevices[inDeviceIndex].outputStreamActive) ? 1 : 0;
             pthread_mutex_unlock(&gStateMutex);
             *outDataSize = sizeof(UInt32);
             return 0;
 
         case kAudioStreamPropertyDirection:
             REQUIRE_SIZE(sizeof(UInt32));
-            *((UInt32*)outData) = theIsInput ? 1 : 0;
+            *((UInt32*)outData) = inIsInput ? 1 : 0;
             *outDataSize = sizeof(UInt32);
             return 0;
 
@@ -1265,7 +1511,7 @@ static OSStatus GetStreamPropertyData(AudioObjectID inObjectID, const AudioObjec
         {
             REQUIRE_SIZE(sizeof(AudioStreamBasicDescription));
             pthread_mutex_lock(&gStateMutex);
-            Float64 theRate = gDevice_SampleRate;
+            Float64 theRate = gDevices[inDeviceIndex].sampleRate;
             pthread_mutex_unlock(&gStateMutex);
             OpenAudio_FillFormat((AudioStreamBasicDescription*)outData, theRate);
             *outDataSize = sizeof(AudioStreamBasicDescription);
@@ -1293,7 +1539,7 @@ static OSStatus GetStreamPropertyData(AudioObjectID inObjectID, const AudioObjec
     }
 }
 
-static OSStatus GetVolumePropertyData(const AudioObjectPropertyAddress* inAddress, UInt32 inDataSize, UInt32* outDataSize, void* outData)
+static OSStatus GetVolumePropertyData(UInt32 inDeviceIndex, const AudioObjectPropertyAddress* inAddress, UInt32 inDataSize, UInt32* outDataSize, void* outData)
 {
     switch(inAddress->mSelector)
     {
@@ -1311,7 +1557,7 @@ static OSStatus GetVolumePropertyData(const AudioObjectPropertyAddress* inAddres
 
         case kAudioObjectPropertyOwner:
             REQUIRE_SIZE(sizeof(AudioObjectID));
-            *((AudioObjectID*)outData) = kObjectID_Device;
+            *((AudioObjectID*)outData) = OA_DeviceID(inDeviceIndex);
             *outDataSize = sizeof(AudioObjectID);
             return 0;
 
@@ -1334,7 +1580,7 @@ static OSStatus GetVolumePropertyData(const AudioObjectPropertyAddress* inAddres
         case kAudioLevelControlPropertyScalarValue:
             REQUIRE_SIZE(sizeof(Float32));
             pthread_mutex_lock(&gStateMutex);
-            *((Float32*)outData) = gVolume_Output_Master_Value;
+            *((Float32*)outData) = gDevices[inDeviceIndex].volumeValue;
             pthread_mutex_unlock(&gStateMutex);
             *outDataSize = sizeof(Float32);
             return 0;
@@ -1342,7 +1588,7 @@ static OSStatus GetVolumePropertyData(const AudioObjectPropertyAddress* inAddres
         case kAudioLevelControlPropertyDecibelValue:
             REQUIRE_SIZE(sizeof(Float32));
             pthread_mutex_lock(&gStateMutex);
-            *((Float32*)outData) = OpenAudio_VolumeScalarToDB(gVolume_Output_Master_Value);
+            *((Float32*)outData) = OpenAudio_VolumeScalarToDB(gDevices[inDeviceIndex].volumeValue);
             pthread_mutex_unlock(&gStateMutex);
             *outDataSize = sizeof(Float32);
             return 0;
@@ -1374,7 +1620,7 @@ static OSStatus GetVolumePropertyData(const AudioObjectPropertyAddress* inAddres
     }
 }
 
-static OSStatus GetMutePropertyData(const AudioObjectPropertyAddress* inAddress, UInt32 inDataSize, UInt32* outDataSize, void* outData)
+static OSStatus GetMutePropertyData(UInt32 inDeviceIndex, const AudioObjectPropertyAddress* inAddress, UInt32 inDataSize, UInt32* outDataSize, void* outData)
 {
     switch(inAddress->mSelector)
     {
@@ -1392,7 +1638,7 @@ static OSStatus GetMutePropertyData(const AudioObjectPropertyAddress* inAddress,
 
         case kAudioObjectPropertyOwner:
             REQUIRE_SIZE(sizeof(AudioObjectID));
-            *((AudioObjectID*)outData) = kObjectID_Device;
+            *((AudioObjectID*)outData) = OA_DeviceID(inDeviceIndex);
             *outDataSize = sizeof(AudioObjectID);
             return 0;
 
@@ -1415,7 +1661,7 @@ static OSStatus GetMutePropertyData(const AudioObjectPropertyAddress* inAddress,
         case kAudioBooleanControlPropertyValue:
             REQUIRE_SIZE(sizeof(UInt32));
             pthread_mutex_lock(&gStateMutex);
-            *((UInt32*)outData) = gMute_Output_Master_Value ? 1 : 0;
+            *((UInt32*)outData) = gDevices[inDeviceIndex].muteValue ? 1 : 0;
             pthread_mutex_unlock(&gStateMutex);
             *outDataSize = sizeof(UInt32);
             return 0;
@@ -1432,16 +1678,17 @@ static OSStatus OpenAudio_GetPropertyData(AudioServerPlugInDriverRef inDriver, A
         return kAudioHardwareIllegalOperationError;
     }
 
-    switch(inObjectID)
+    UInt32 d = 0;
+    switch(OA_Resolve(inObjectID, true, &d))
     {
-        case kObjectID_PlugIn:                   return GetPlugInPropertyData(inClientProcessID, inAddress, inQualifierDataSize, inQualifierData, inDataSize, outDataSize, outData);
-        case kObjectID_Box:                      return GetBoxPropertyData(inAddress, inDataSize, outDataSize, outData);
-        case kObjectID_Device:                   return GetDevicePropertyData(inAddress, inDataSize, outDataSize, outData);
-        case kObjectID_Stream_Input:
-        case kObjectID_Stream_Output:            return GetStreamPropertyData(inObjectID, inAddress, inDataSize, outDataSize, outData);
-        case kObjectID_Volume_Output_Master:     return GetVolumePropertyData(inAddress, inDataSize, outDataSize, outData);
-        case kObjectID_Mute_Output_Master:       return GetMutePropertyData(inAddress, inDataSize, outDataSize, outData);
-        default:                                 return kAudioHardwareBadObjectError;
+        case kObjectKind_PlugIn:        return GetPlugInPropertyData(inClientProcessID, inAddress, inQualifierDataSize, inQualifierData, inDataSize, outDataSize, outData);
+        case kObjectKind_Box:           return GetBoxPropertyData(inAddress, inDataSize, outDataSize, outData);
+        case kObjectKind_Device:        return GetDevicePropertyData(d, inAddress, inDataSize, outDataSize, outData);
+        case kObjectKind_StreamInput:   return GetStreamPropertyData(d, true,  inAddress, inDataSize, outDataSize, outData);
+        case kObjectKind_StreamOutput:  return GetStreamPropertyData(d, false, inAddress, inDataSize, outDataSize, outData);
+        case kObjectKind_Volume:        return GetVolumePropertyData(d, inAddress, inDataSize, outDataSize, outData);
+        case kObjectKind_Mute:          return GetMutePropertyData(d, inAddress, inDataSize, outDataSize, outData);
+        default:                        return kAudioHardwareBadObjectError;
     }
 }
 
@@ -1463,9 +1710,114 @@ static OSStatus OpenAudio_SetPropertyData(AudioServerPlugInDriverRef inDriver, A
 
     OSStatus theError = kAudioHardwareUnknownPropertyError;
 
-    switch(inObjectID)
+    UInt32 d = 0;
+    OAObjectKind theKind = OA_Resolve(inObjectID, true, &d);
+
+    switch(theKind)
     {
-        case kObjectID_Box:
+        case kObjectKind_PlugIn:
+            switch(inAddress->mSelector)
+            {
+                case kOpenAudioPropertyDeviceCount:
+                {
+                    /* CFPropertyList-typed custom property: inData carries a
+                       CFPropertyListRef owned by the caller (do not release).
+                       Accept only a CFNumber holding 1...kOpenAudioMaxDevices. */
+                    if(inDataSize < sizeof(CFPropertyListRef)) { return kAudioHardwareBadPropertySizeError; }
+                    CFPropertyListRef thePlist = *((const CFPropertyListRef*)inData);
+                    if((thePlist == NULL) || (CFGetTypeID(thePlist) != CFNumberGetTypeID()))
+                    {
+                        return kAudioHardwareIllegalOperationError;
+                    }
+                    SInt32 theRequested = 0;
+                    if(!CFNumberGetValue((CFNumberRef)thePlist, kCFNumberSInt32Type, &theRequested))
+                    {
+                        return kAudioHardwareIllegalOperationError;
+                    }
+                    if((theRequested < 1) || (theRequested > kOpenAudioMaxDevices))
+                    {
+                        return kAudioHardwareIllegalOperationError;
+                    }
+                    UInt32 theNewCount = (UInt32)theRequested;
+
+                    bool theChangedFlag = false;
+                    pthread_mutex_lock(&gStateMutex);
+                    UInt32 theOldCount = gDeviceCount;
+                    if(theNewCount > theOldCount)
+                    {
+                        /* Publish new slots: reset them to fresh defaults. Skip
+                           the reset if a slot still has a live IO thread (a
+                           device that was just unpublished whose StopIO has not
+                           yet arrived). Its clock-anchor fields are read without
+                           a lock by that IO thread, so we must not race a write
+                           against it; it self-heals on the next StartIO once
+                           ioRunningCount has returned to 0. */
+                        for(UInt32 i = theOldCount; i < theNewCount; ++i)
+                        {
+                            if(gDevices[i].ioRunningCount == 0)
+                            {
+                                OA_InitDeviceSlot(i);
+                            }
+                        }
+                        gDeviceCount = theNewCount;
+                        theChangedFlag = true;
+                    }
+                    else if(theNewCount < theOldCount)
+                    {
+                        /* Unpublish trailing slots. Their per-device state is left
+                           in place; surviving devices (lower indices) and their
+                           rings/anchors are untouched. A future re-publish re-inits
+                           the slot. */
+                        gDeviceCount = theNewCount;
+                        theChangedFlag = true;
+                    }
+                    pthread_mutex_unlock(&gStateMutex);
+
+                    if(theChangedFlag)
+                    {
+                        /* Persist and notify the host that the device set changed.
+                           Done outside the state lock so host callbacks cannot
+                           deadlock against it. */
+                        OA_PersistDeviceCount(theNewCount);
+
+                        theChanged[theChangedCount].mSelector = kAudioPlugInPropertyDeviceList;
+                        theChanged[theChangedCount].mScope    = kAudioObjectPropertyScopeGlobal;
+                        theChanged[theChangedCount].mElement  = kAudioObjectPropertyElementMain;
+                        ++theChangedCount;
+                        theChanged[theChangedCount].mSelector = kAudioObjectPropertyOwnedObjects;
+                        theChanged[theChangedCount].mScope    = kAudioObjectPropertyScopeGlobal;
+                        theChanged[theChangedCount].mElement  = kAudioObjectPropertyElementMain;
+                        ++theChangedCount;
+                        theChanged[theChangedCount].mSelector = kOpenAudioPropertyDeviceCount;
+                        theChanged[theChangedCount].mScope    = kAudioObjectPropertyScopeGlobal;
+                        theChanged[theChangedCount].mElement  = kAudioObjectPropertyElementMain;
+                        ++theChangedCount;
+
+                        /* The box also enumerates the devices, so notify it too.
+                           This is a separate object from inObjectID (the plug-in),
+                           so it needs its own PropertiesChanged call; the generic
+                           tail below only fires for inObjectID. */
+                        if(gPlugIn_Host != NULL)
+                        {
+                            AudioObjectPropertyAddress theBoxChanged =
+                            {
+                                kAudioBoxPropertyDeviceList,
+                                kAudioObjectPropertyScopeGlobal,
+                                kAudioObjectPropertyElementMain
+                            };
+                            gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Box, 1, &theBoxChanged);
+                        }
+                    }
+                    theError = 0;
+                    break;
+                }
+                default:
+                    theError = kAudioHardwareUnknownPropertyError;
+                    break;
+            }
+            break;
+
+        case kObjectKind_Box:
             switch(inAddress->mSelector)
             {
                 case kAudioObjectPropertyName:
@@ -1490,7 +1842,7 @@ static OSStatus OpenAudio_SetPropertyData(AudioServerPlugInDriverRef inDriver, A
             }
             break;
 
-        case kObjectID_Device:
+        case kObjectKind_Device:
             switch(inAddress->mSelector)
             {
                 case kAudioDevicePropertyNominalSampleRate:
@@ -1502,7 +1854,7 @@ static OSStatus OpenAudio_SetPropertyData(AudioServerPlugInDriverRef inDriver, A
                         return kAudioHardwareIllegalOperationError;
                     }
                     pthread_mutex_lock(&gStateMutex);
-                    Float64 theCurrentRate = gDevice_SampleRate;
+                    Float64 theCurrentRate = gDevices[d].sampleRate;
                     pthread_mutex_unlock(&gStateMutex);
                     if(theNewRate != theCurrentRate)
                     {
@@ -1510,7 +1862,7 @@ static OSStatus OpenAudio_SetPropertyData(AudioServerPlugInDriverRef inDriver, A
                            happens in PerformDeviceConfigurationChange. */
                         if(gPlugIn_Host != NULL)
                         {
-                            gPlugIn_Host->RequestDeviceConfigurationChange(gPlugIn_Host, kObjectID_Device, (UInt64)theNewRate, NULL);
+                            gPlugIn_Host->RequestDeviceConfigurationChange(gPlugIn_Host, OA_DeviceID(d), (UInt64)theNewRate, NULL);
                         }
                     }
                     theError = 0;
@@ -1522,8 +1874,8 @@ static OSStatus OpenAudio_SetPropertyData(AudioServerPlugInDriverRef inDriver, A
             }
             break;
 
-        case kObjectID_Stream_Input:
-        case kObjectID_Stream_Output:
+        case kObjectKind_StreamInput:
+        case kObjectKind_StreamOutput:
             switch(inAddress->mSelector)
             {
                 case kAudioStreamPropertyIsActive:
@@ -1531,8 +1883,8 @@ static OSStatus OpenAudio_SetPropertyData(AudioServerPlugInDriverRef inDriver, A
                     if(inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
                     bool theActive = (*((const UInt32*)inData) != 0);
                     pthread_mutex_lock(&gStateMutex);
-                    if(inObjectID == kObjectID_Stream_Input) { gStream_Input_Active = theActive; }
-                    else                                     { gStream_Output_Active = theActive; }
+                    if(theKind == kObjectKind_StreamInput) { gDevices[d].inputStreamActive = theActive; }
+                    else                                   { gDevices[d].outputStreamActive = theActive; }
                     pthread_mutex_unlock(&gStateMutex);
                     theChanged[theChangedCount].mSelector = kAudioStreamPropertyIsActive;
                     theChanged[theChangedCount].mScope = kAudioObjectPropertyScopeGlobal;
@@ -1556,13 +1908,13 @@ static OSStatus OpenAudio_SetPropertyData(AudioServerPlugInDriverRef inDriver, A
                         return kAudioHardwareIllegalOperationError;
                     }
                     pthread_mutex_lock(&gStateMutex);
-                    Float64 theCurrentRate = gDevice_SampleRate;
+                    Float64 theCurrentRate = gDevices[d].sampleRate;
                     pthread_mutex_unlock(&gStateMutex);
                     if(theFormat->mSampleRate != theCurrentRate)
                     {
                         if(gPlugIn_Host != NULL)
                         {
-                            gPlugIn_Host->RequestDeviceConfigurationChange(gPlugIn_Host, kObjectID_Device, (UInt64)theFormat->mSampleRate, NULL);
+                            gPlugIn_Host->RequestDeviceConfigurationChange(gPlugIn_Host, OA_DeviceID(d), (UInt64)theFormat->mSampleRate, NULL);
                         }
                     }
                     theError = 0;
@@ -1574,7 +1926,7 @@ static OSStatus OpenAudio_SetPropertyData(AudioServerPlugInDriverRef inDriver, A
             }
             break;
 
-        case kObjectID_Volume_Output_Master:
+        case kObjectKind_Volume:
             switch(inAddress->mSelector)
             {
                 case kAudioLevelControlPropertyScalarValue:
@@ -1584,7 +1936,7 @@ static OSStatus OpenAudio_SetPropertyData(AudioServerPlugInDriverRef inDriver, A
                     if(theValue < 0.0f) { theValue = 0.0f; }
                     if(theValue > 1.0f) { theValue = 1.0f; }
                     pthread_mutex_lock(&gStateMutex);
-                    gVolume_Output_Master_Value = theValue;
+                    gDevices[d].volumeValue = theValue;
                     pthread_mutex_unlock(&gStateMutex);
                     theChanged[theChangedCount].mSelector = kAudioLevelControlPropertyScalarValue; theChanged[theChangedCount].mScope = kAudioObjectPropertyScopeGlobal; theChanged[theChangedCount].mElement = kAudioObjectPropertyElementMain; ++theChangedCount;
                     theChanged[theChangedCount].mSelector = kAudioLevelControlPropertyDecibelValue; theChanged[theChangedCount].mScope = kAudioObjectPropertyScopeGlobal; theChanged[theChangedCount].mElement = kAudioObjectPropertyElementMain; ++theChangedCount;
@@ -1596,7 +1948,7 @@ static OSStatus OpenAudio_SetPropertyData(AudioServerPlugInDriverRef inDriver, A
                     if(inDataSize < sizeof(Float32)) { return kAudioHardwareBadPropertySizeError; }
                     Float32 theValue = OpenAudio_VolumeDBToScalar(*((const Float32*)inData));
                     pthread_mutex_lock(&gStateMutex);
-                    gVolume_Output_Master_Value = theValue;
+                    gDevices[d].volumeValue = theValue;
                     pthread_mutex_unlock(&gStateMutex);
                     theChanged[theChangedCount].mSelector = kAudioLevelControlPropertyScalarValue; theChanged[theChangedCount].mScope = kAudioObjectPropertyScopeGlobal; theChanged[theChangedCount].mElement = kAudioObjectPropertyElementMain; ++theChangedCount;
                     theChanged[theChangedCount].mSelector = kAudioLevelControlPropertyDecibelValue; theChanged[theChangedCount].mScope = kAudioObjectPropertyScopeGlobal; theChanged[theChangedCount].mElement = kAudioObjectPropertyElementMain; ++theChangedCount;
@@ -1609,13 +1961,13 @@ static OSStatus OpenAudio_SetPropertyData(AudioServerPlugInDriverRef inDriver, A
             }
             break;
 
-        case kObjectID_Mute_Output_Master:
+        case kObjectKind_Mute:
             switch(inAddress->mSelector)
             {
                 case kAudioBooleanControlPropertyValue:
                     if(inDataSize < sizeof(UInt32)) { return kAudioHardwareBadPropertySizeError; }
                     pthread_mutex_lock(&gStateMutex);
-                    gMute_Output_Master_Value = (*((const UInt32*)inData) != 0);
+                    gDevices[d].muteValue = (*((const UInt32*)inData) != 0);
                     pthread_mutex_unlock(&gStateMutex);
                     theChanged[theChangedCount].mSelector = kAudioBooleanControlPropertyValue;
                     theChanged[theChangedCount].mScope = kAudioObjectPropertyScopeGlobal;
@@ -1649,25 +2001,29 @@ static OSStatus OpenAudio_StartIO(AudioServerPlugInDriverRef inDriver, AudioObje
 {
     #pragma unused(inClientID)
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
-    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+
+    UInt32 d = 0;
+    if(OA_Resolve(inDeviceObjectID, true, &d) != kObjectKind_Device) { return kAudioHardwareBadObjectError; }
+
+    OADevice* dev = &gDevices[d];
 
     pthread_mutex_lock(&gStateMutex);
-    if(gDevice_IORunningCount == 0)
+    if(dev->ioRunningCount == 0)
     {
         /* First client: initialize the clock anchor and clear the ring so a
            fresh run starts from silence. */
         struct mach_timebase_info theTimeBaseInfo;
         mach_timebase_info(&theTimeBaseInfo);
         Float64 theHostClockFrequency = ((Float64)theTimeBaseInfo.denom / (Float64)theTimeBaseInfo.numer) * 1000000000.0;
-        gDevice_HostTicksPerFrame = theHostClockFrequency / gDevice_SampleRate;
-        gDevice_AnchorHostTime = mach_absolute_time();
-        gDevice_NumberTimeStamps = 0;
-        memset(gRingBuffer, 0, sizeof(gRingBuffer));
-        gDevice_IORunningCount = 1;
+        dev->hostTicksPerFrame = theHostClockFrequency / dev->sampleRate;
+        dev->anchorHostTime = mach_absolute_time();
+        dev->numberTimeStamps = 0;
+        memset(dev->ring, 0, kRingBufferBytes);
+        dev->ioRunningCount = 1;
     }
     else
     {
-        ++gDevice_IORunningCount;
+        ++dev->ioRunningCount;
     }
     pthread_mutex_unlock(&gStateMutex);
 
@@ -1678,10 +2034,13 @@ static OSStatus OpenAudio_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjec
 {
     #pragma unused(inClientID)
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
-    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+
+    UInt32 d = 0;
+    /* Tolerate a device that has just been unpublished (in-flight teardown). */
+    if(OA_Resolve(inDeviceObjectID, false, &d) != kObjectKind_Device) { return kAudioHardwareBadObjectError; }
 
     pthread_mutex_lock(&gStateMutex);
-    if(gDevice_IORunningCount > 0) { --gDevice_IORunningCount; }
+    if(gDevices[d].ioRunningCount > 0) { --gDevices[d].ioRunningCount; }
     pthread_mutex_unlock(&gStateMutex);
 
     return 0;
@@ -1695,25 +2054,29 @@ static OSStatus OpenAudio_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, 
 {
     #pragma unused(inClientID)
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
-    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+
+    UInt32 d = 0;
+    if(OA_Resolve(inDeviceObjectID, false, &d) != kObjectKind_Device) { return kAudioHardwareBadObjectError; }
+
+    OADevice* dev = &gDevices[d];
 
     /* mach_absolute_time is a userspace read of the timebase register: no
-       syscall, safe on the IO thread. gDevice_* clock state is written only by
-       this single IO thread once IO is running, so no lock is needed. */
+       syscall, safe on the IO thread. This device's clock state is written only
+       by its single IO thread once IO is running, so no lock is needed. */
     UInt64 theCurrentHostTime = mach_absolute_time();
 
-    Float64 theHostTicksPerPeriod = gDevice_HostTicksPerFrame * (Float64)kZeroTimestampPeriod;
+    Float64 theHostTicksPerPeriod = dev->hostTicksPerFrame * (Float64)kZeroTimestampPeriod;
 
     /* Advance the anchor if a full period has elapsed since the last one. */
-    UInt64 theNextTimeStampNumber = gDevice_NumberTimeStamps + 1;
-    UInt64 theNextAnchorHostTime = gDevice_AnchorHostTime + (UInt64)((Float64)theNextTimeStampNumber * theHostTicksPerPeriod);
+    UInt64 theNextTimeStampNumber = dev->numberTimeStamps + 1;
+    UInt64 theNextAnchorHostTime = dev->anchorHostTime + (UInt64)((Float64)theNextTimeStampNumber * theHostTicksPerPeriod);
     if(theCurrentHostTime >= theNextAnchorHostTime)
     {
-        ++gDevice_NumberTimeStamps;
+        ++dev->numberTimeStamps;
     }
 
-    *outSampleTime = (Float64)(gDevice_NumberTimeStamps * kZeroTimestampPeriod);
-    *outHostTime = gDevice_AnchorHostTime + (UInt64)((Float64)gDevice_NumberTimeStamps * theHostTicksPerPeriod);
+    *outSampleTime = (Float64)(dev->numberTimeStamps * kZeroTimestampPeriod);
+    *outHostTime = dev->anchorHostTime + (UInt64)((Float64)dev->numberTimeStamps * theHostTicksPerPeriod);
     *outSeed = 1;
 
     return 0;
@@ -1727,7 +2090,7 @@ static OSStatus OpenAudio_WillDoIOOperation(AudioServerPlugInDriverRef inDriver,
 {
     #pragma unused(inClientID)
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
-    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+    if(OA_Resolve(inDeviceObjectID, false, NULL) != kObjectKind_Device) { return kAudioHardwareBadObjectError; }
 
     Boolean theWillDo = false;
     Boolean theWillDoInPlace = true;
@@ -1753,7 +2116,7 @@ static OSStatus OpenAudio_BeginIOOperation(AudioServerPlugInDriverRef inDriver, 
 {
     #pragma unused(inClientID, inOperationID, inIOBufferFrameSize, inIOCycleInfo)
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
-    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+    if(OA_Resolve(inDeviceObjectID, false, NULL) != kObjectKind_Device) { return kAudioHardwareBadObjectError; }
     return 0;
 }
 
@@ -1761,8 +2124,12 @@ static OSStatus OpenAudio_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
 {
     #pragma unused(inClientID, inStreamObjectID, ioSecondaryBuffer)
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
-    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+
+    UInt32 d = 0;
+    if(OA_Resolve(inDeviceObjectID, false, &d) != kObjectKind_Device) { return kAudioHardwareBadObjectError; }
     if((ioMainBuffer == NULL) || (inIOBufferFrameSize == 0)) { return 0; }
+
+    Float32* theRing = gDevices[d].ring;
 
     if(inOperationID == kAudioServerPlugInIOOperationWriteMix)
     {
@@ -1773,7 +2140,7 @@ static OSStatus OpenAudio_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
         for(UInt32 theFrame = 0; theFrame < inIOBufferFrameSize; ++theFrame)
         {
             UInt64 theRingFrame = (theBaseFrame + theFrame) & kRingBufferFrameMask;
-            memcpy(&gRingBuffer[theRingFrame * kNumberOfChannels],
+            memcpy(&theRing[theRingFrame * kNumberOfChannels],
                    &theSource[(UInt64)theFrame * kNumberOfChannels],
                    kBytesPerFrame);
         }
@@ -1789,7 +2156,7 @@ static OSStatus OpenAudio_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
         {
             UInt64 theRingFrame = (theBaseFrame + theFrame) & kRingBufferFrameMask;
             memcpy(&theDest[(UInt64)theFrame * kNumberOfChannels],
-                   &gRingBuffer[theRingFrame * kNumberOfChannels],
+                   &theRing[theRingFrame * kNumberOfChannels],
                    kBytesPerFrame);
         }
     }
@@ -1801,6 +2168,6 @@ static OSStatus OpenAudio_EndIOOperation(AudioServerPlugInDriverRef inDriver, Au
 {
     #pragma unused(inClientID, inOperationID, inIOBufferFrameSize, inIOCycleInfo)
     if(inDriver != gAudioServerPlugInDriverRef) { return kAudioHardwareBadObjectError; }
-    if(inDeviceObjectID != kObjectID_Device) { return kAudioHardwareBadObjectError; }
+    if(OA_Resolve(inDeviceObjectID, false, NULL) != kObjectKind_Device) { return kAudioHardwareBadObjectError; }
     return 0;
 }
