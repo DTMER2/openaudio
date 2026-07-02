@@ -78,6 +78,11 @@ func runEngine(_ o: RunOptions) throws {
     try engine.start()
     activeEngine = engine
 
+    // Apply requested monitoring (F-M1/M2) once buses are attached.
+    if let mbus = o.monitorBus {
+        engine.setMonitor(busIndex: mbus, gainDB: o.monitorGainDB)
+    }
+
     // Clean finalize on Ctrl-C.
     signal(SIGINT, SIG_IGN)
     let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
@@ -116,9 +121,14 @@ func dbStr(_ v: Float) -> String { v.isFinite ? String(format: "%.1f", v) : "-in
 
 func printStats(_ engine: Engine) {
     let s = engine.stats()
+    // Per-channel (L/R) meters (F-U4): "pk L/R rms L/R".
+    func meterStr(_ m: StereoMeter) -> String {
+        String(format: "pk %@/%@ rms %@/%@",
+               dbStr(m.peakL), dbStr(m.peakR), dbStr(m.rmsL), dbStr(m.rmsR))
+    }
     var srcStr = ""
-    for m in s.sources {
-        srcStr += String(format: " %@[pk %@ rms %@]", m.name, dbStr(m.peakDB), dbStr(m.rmsDB))
+    for m in s.sourcesStereo {
+        srcStr += String(format: " %@[%@]", m.name, meterStr(m))
     }
     var busStr = ""
     for b in s.buses {
@@ -126,9 +136,11 @@ func printStats(_ engine: Engine) {
                          b.index + 1, b.fillFrames, b.fillPct, b.ratioPPM,
                          b.underruns, b.overruns, b.consumerCallbacks)
     }
-    let line = String(format: "mix[pk %@ rms %@]%@ |%@ | route %@ | wdog %llu",
-                      dbStr(s.busMixPeakDB), dbStr(s.busMixRMSDB), srcStr, busStr,
-                      engine.routingDescription(), s.watchdogEvents)
+    let (monBus, monGain) = engine.monitorSelection()
+    let monStr = monBus.map { String(format: "b%d %+.1fdB", $0 + 1, monGain) } ?? "off"
+    let line = String(format: "mix[%@]%@ |%@ | route %@ | mon %@ | wdog %llu",
+                      meterStr(s.busMixStereo), srcStr, busStr,
+                      engine.routingDescription(), monStr, s.watchdogEvents)
     OALog.info(line)
 }
 
@@ -204,6 +216,21 @@ func handleCommand(_ engine: Engine, _ cmd: String, _ args: [String],
         guard args.count == 1, let bus1 = Int(args[0]), bus1 >= 1 else { throw OAError("usage: detach <bus>") }
         try engine.detachBus(bus1 - 1)
         OALog.info("detached bus \(bus1); attached: \(engine.attachedBusIndices().map { $0 + 1 })")
+    case "monitor":
+        guard args.count >= 1 else { throw OAError("usage: monitor <bus|off> [gainDB]") }
+        if args[0].lowercased() == "off" {
+            engine.setMonitor(busIndex: nil, gainDB: 0)
+            OALog.info("monitor off")
+        } else {
+            guard let bus1 = Int(args[0]), bus1 >= 1 else { throw OAError("monitor bus must be a 1-based integer or 'off'") }
+            var db: Float = 0
+            if args.count >= 2 {
+                guard let g = Float(args[1]) else { throw OAError("monitor gain must be a number (dB)") }
+                db = g
+            }
+            engine.setMonitor(busIndex: bus1 - 1, gainDB: db)
+            OALog.info("monitor bus \(bus1) @ \(db) dB")
+        }
     case "stats":
         printStats(engine)
     case "quit", "exit", "q":
@@ -212,7 +239,7 @@ func handleCommand(_ engine: Engine, _ cmd: String, _ args: [String],
         activeEngine?.stop()
         exit(0)
     default:
-        OALog.warn("unknown command '\(cmd)' (route|gain|pan|mute|attach|detach|stats|quit)")
+        OALog.warn("unknown command '\(cmd)' (route|gain|pan|mute|attach|detach|monitor|stats|quit)")
     }
 }
 
@@ -221,10 +248,10 @@ func handleCommand(_ engine: Engine, _ cmd: String, _ args: [String],
 func runBuses(count: Int?) throws {
     if let n = count {
         OALog.info("Setting driver device count to \(n) via control plane...")
-        let applied = try ControlPlane.setDeviceCount(n)
+        let applied = try OpenAudioControlPlane.setDeviceCount(n)
         OALog.info("Device count set to \(applied); HAL device list settled.")
     } else {
-        let current = try ControlPlane.deviceCount()
+        let current = try OpenAudioControlPlane.deviceCount()
         OALog.info("Current driver device count: \(current)")
     }
     // List the resulting OpenAudio devices.
@@ -243,6 +270,26 @@ func runBuses(count: Int?) throws {
         print(pad(String(d.id), 6) + pad(String(d.inChannels), 4) + pad(String(d.outChannels), 5)
               + pad(String(Int(d.sampleRate)), 8) + pad(d.name, 28) + d.uid)
     }
+}
+
+// MARK: - processes (F-U3)
+
+func runProcesses() throws {
+    let infos = try AudioProcessCatalog.listAudioProcesses()
+    guard !infos.isEmpty else { print("No audio process objects found."); return }
+    func pad(_ s: String, _ w: Int) -> String {
+        let t = s.count > w - 1 ? String(s.prefix(w - 1)) : s
+        return t + String(repeating: " ", count: max(0, w - t.count))
+    }
+    print(pad("PID", 8) + pad("OUTPUT", 8) + pad("NAME", 30) + "BUNDLE ID")
+    print(String(repeating: "-", count: 78))
+    for i in infos {
+        print(pad(String(i.pid), 8) + pad(i.isRunningOutput ? "yes" : "-", 8)
+              + pad(i.name, 30) + (i.bundleID ?? ""))
+    }
+    let active = infos.filter { $0.isRunningOutput }.count
+    FileHandle.standardError.write(Data(
+        "\n\(infos.count) process objects, \(active) currently producing output.\n".utf8))
 }
 
 // MARK: - probe-vdev
@@ -330,6 +377,8 @@ do {
         print(CLI.usage); exit(0)
     case .devices:
         runDevices(); exit(0)
+    case .processes:
+        try runProcesses(); exit(0)
     case .probeVDev(let out, let dur, let uid):
         try runProbe(output: out, duration: dur, deviceUID: uid); exit(0)
     case .buses(let count):

@@ -15,6 +15,31 @@ public struct SourceMeter {
     public var name: String
     public var peakDB: Float
     public var rmsDB: Float
+
+    public init(name: String, peakDB: Float, rmsDB: Float) {
+        self.name = name; self.peakDB = peakDB; self.rmsDB = rmsDB
+    }
+}
+
+/// Per-channel (L/R) meter (F-U4 / F-E4). All levels are dBFS (-inf allowed).
+/// Keeps the deliberate max-hold-since-last-poll behaviour, now per channel.
+public struct StereoMeter {
+    public var name: String
+    public var peakL: Float
+    public var peakR: Float
+    public var rmsL: Float
+    public var rmsR: Float
+
+    public init(name: String, peakL: Float, peakR: Float, rmsL: Float, rmsR: Float) {
+        self.name = name
+        self.peakL = peakL; self.peakR = peakR
+        self.rmsL = rmsL; self.rmsR = rmsR
+    }
+
+    /// Mono summaries (max of the two channels) for backward-compatible display.
+    public var peakDB: Float { max(peakL, peakR) }
+    public var rmsDB: Float { max(rmsL, rmsR) }
+    public var mono: SourceMeter { SourceMeter(name: name, peakDB: peakDB, rmsDB: rmsDB) }
 }
 
 public final class Monitor: @unchecked Sendable {
@@ -23,13 +48,20 @@ public final class Monitor: @unchecked Sendable {
     private let sampleRate: Double
     private let sourceNames: [String]   // e.g. ["tap"] or ["tap","input"]
 
-    // Published meters: index 0 = bus, then one per source. Peak/RMS as Float bits.
-    private let peakBits: [Atomic64]
-    private let rmsBits: [Atomic64]
-    // Max-hold since the last meters() poll — the smoothed values decay too fast
-    // (~16 dB/s) to be sampled at a 2 s stats interval without missing bursts.
-    private let holdPeakBits: [Atomic64]
-    private let holdRMSBits: [Atomic64]
+    // Published meters: index 0 = bus, then one per source. Peak/RMS as Float
+    // bits, tracked PER CHANNEL (L/R) for F-U4. The smoothed values are the
+    // fallback when no block arrived since the last poll.
+    private let peakLBits: [Atomic64]
+    private let peakRBits: [Atomic64]
+    private let rmsLBits: [Atomic64]
+    private let rmsRBits: [Atomic64]
+    // Max-hold since the last stereoMeters() poll — the smoothed values decay
+    // too fast (~16 dB/s) to be sampled at a 2 s stats interval without missing
+    // bursts. Preserved per channel.
+    private let holdPeakLBits: [Atomic64]
+    private let holdPeakRBits: [Atomic64]
+    private let holdRMSLBits: [Atomic64]
+    private let holdRMSRBits: [Atomic64]
 
     // Watchdog signals (bus).
     public let lastNonZeroMach = Atomic64(0)
@@ -44,8 +76,10 @@ public final class Monitor: @unchecked Sendable {
     private let blockFrames = 4096
     private var scratch: UnsafeMutablePointer<Float>
     private var stereoScratch: UnsafeMutablePointer<Float>
-    private var smoothPeak: [Float]
-    private var smoothRMS: [Float]
+    private var smoothPeakL: [Float]
+    private var smoothPeakR: [Float]
+    private var smoothRMSL: [Float]
+    private var smoothRMSR: [Float]
 
     /// - Parameter sourceNames: source columns after the bus (bus is implicit index 0).
     public init(ring: MonitorRing, sampleRate: Double, sourceNames: [String], recordURL: URL?) throws {
@@ -54,12 +88,18 @@ public final class Monitor: @unchecked Sendable {
         self.sampleRate = sampleRate
         self.sourceNames = sourceNames
         let meterCount = 1 + sourceNames.count       // bus + sources
-        self.peakBits = (0..<meterCount).map { _ in Atomic64(0) }
-        self.rmsBits = (0..<meterCount).map { _ in Atomic64(0) }
-        self.holdPeakBits = (0..<meterCount).map { _ in Atomic64(0) }
-        self.holdRMSBits = (0..<meterCount).map { _ in Atomic64(0) }
-        self.smoothPeak = [Float](repeating: 0, count: meterCount)
-        self.smoothRMS = [Float](repeating: 0, count: meterCount)
+        self.peakLBits = (0..<meterCount).map { _ in Atomic64(0) }
+        self.peakRBits = (0..<meterCount).map { _ in Atomic64(0) }
+        self.rmsLBits = (0..<meterCount).map { _ in Atomic64(0) }
+        self.rmsRBits = (0..<meterCount).map { _ in Atomic64(0) }
+        self.holdPeakLBits = (0..<meterCount).map { _ in Atomic64(0) }
+        self.holdPeakRBits = (0..<meterCount).map { _ in Atomic64(0) }
+        self.holdRMSLBits = (0..<meterCount).map { _ in Atomic64(0) }
+        self.holdRMSRBits = (0..<meterCount).map { _ in Atomic64(0) }
+        self.smoothPeakL = [Float](repeating: 0, count: meterCount)
+        self.smoothPeakR = [Float](repeating: 0, count: meterCount)
+        self.smoothRMSL = [Float](repeating: 0, count: meterCount)
+        self.smoothRMSR = [Float](repeating: 0, count: meterCount)
         self.scratch = UnsafeMutablePointer<Float>.allocate(capacity: blockFrames * monChannels)
         self.stereoScratch = UnsafeMutablePointer<Float>.allocate(capacity: blockFrames * 2)
         lastNonZeroMach.store(MachClock.now())
@@ -114,27 +154,36 @@ public final class Monitor: @unchecked Sendable {
 
     // MARK: Published readings
 
-    public func meters() -> (bus: SourceMeter, sources: [SourceMeter]) {
+    /// Per-channel (L/R) meters (F-U4). Reports the max-since-last-poll per
+    /// channel, then resets the hold; falls back to the smoothed value when no
+    /// block arrived since the last poll. The read-then-reset race with a
+    /// concurrent analyze() block can drop at most one block from the hold —
+    /// acceptable for display. Index 0 is the bus, then one per source.
+    public func stereoMeters() -> (bus: StereoMeter, sources: [StereoMeter]) {
         func dB(_ v: Float) -> Float { v > 0 ? 20 * log10f(v) : -Float.infinity }
-        // Report the max since the last poll, then reset the hold. Fall back to
-        // the smoothed value when no block arrived since the last poll. The
-        // read-then-reset race with a concurrent analyze() block can drop at
-        // most one block from the hold — acceptable for display.
         func take(_ hold: Atomic64, _ smooth: Atomic64) -> Float {
             let h = hold.loadFloat()
             hold.storeFloat(0)
             return h > 0 ? h : smooth.loadFloat()
         }
-        let bus = SourceMeter(name: "bus",
-                              peakDB: dB(take(holdPeakBits[0], peakBits[0])),
-                              rmsDB: dB(take(holdRMSBits[0], rmsBits[0])))
-        var srcs: [SourceMeter] = []
-        for (i, name) in sourceNames.enumerated() {
-            srcs.append(SourceMeter(name: name,
-                                    peakDB: dB(take(holdPeakBits[i + 1], peakBits[i + 1])),
-                                    rmsDB: dB(take(holdRMSBits[i + 1], rmsBits[i + 1]))))
+        func meter(_ m: Int, _ name: String) -> StereoMeter {
+            StereoMeter(
+                name: name,
+                peakL: dB(take(holdPeakLBits[m], peakLBits[m])),
+                peakR: dB(take(holdPeakRBits[m], peakRBits[m])),
+                rmsL: dB(take(holdRMSLBits[m], rmsLBits[m])),
+                rmsR: dB(take(holdRMSRBits[m], rmsRBits[m])))
         }
+        let bus = meter(0, "bus")
+        var srcs: [StereoMeter] = []
+        for (i, name) in sourceNames.enumerated() { srcs.append(meter(i + 1, name)) }
         return (bus, srcs)
+    }
+
+    /// Backward-compatible mono (max L/R) meters.
+    public func meters() -> (bus: SourceMeter, sources: [SourceMeter]) {
+        let (bus, srcs) = stereoMeters()
+        return (bus.mono, srcs.map { $0.mono })
     }
 
     public func secondsSinceLastNonZero() -> Double { MachClock.seconds(since: lastNonZeroMach.load()) }
@@ -177,19 +226,18 @@ public final class Monitor: @unchecked Sendable {
             if everHadAudio.load() == 0 { everHadAudio.store(1) }
         }
 
-        // Peak + RMS per meter (each meter = a stereo pair of columns).
-        for m in 0..<meterCount {
-            let cL = m * 2
-            let cR = m * 2 + 1
-            var pL: Float = 0, pR: Float = 0, rL: Float = 0, rR: Float = 0
-            vDSP_maxmgv(scratch + cL, monChannels, &pL, vDSP_Length(frames))
-            vDSP_maxmgv(scratch + cR, monChannels, &pR, vDSP_Length(frames))
-            vDSP_rmsqv(scratch + cL, monChannels, &rL, vDSP_Length(frames))
-            vDSP_rmsqv(scratch + cR, monChannels, &rR, vDSP_Length(frames))
-            let peak = max(pL, pR)
-            let rms = max(rL, rR)
+        // Peak + RMS per meter, per channel (each meter = a stereo pair of
+        // columns). Smoothing/hold identical to before, now tracked per L/R.
+        @inline(__always)
+        func update(_ m: Int, col: Int,
+                    smoothPeak: inout [Float], smoothRMS: inout [Float],
+                    peakBits: [Atomic64], rmsBits: [Atomic64],
+                    holdPeak: [Atomic64], holdRMS: [Atomic64]) {
+            var pk: Float = 0, rms: Float = 0
+            vDSP_maxmgv(scratch + col, monChannels, &pk, vDSP_Length(frames))
+            vDSP_rmsqv(scratch + col, monChannels, &rms, vDSP_Length(frames))
             // Fast-attack / slow-release peak smoothing; RMS exponential smoothing.
-            smoothPeak[m] = peak > smoothPeak[m] ? peak : (smoothPeak[m] * 0.85 + peak * 0.15)
+            smoothPeak[m] = pk > smoothPeak[m] ? pk : (smoothPeak[m] * 0.85 + pk * 0.15)
             smoothRMS[m] = smoothRMS[m] * 0.8 + rms * 0.2
             // Flush denormal decay to zero so dB readouts don't run off to
             // absurd values (~-140 dBFS floor).
@@ -197,10 +245,16 @@ public final class Monitor: @unchecked Sendable {
             if smoothRMS[m] < 1e-7 { smoothRMS[m] = 0 }
             peakBits[m].storeFloat(smoothPeak[m])
             rmsBits[m].storeFloat(smoothRMS[m])
-            // Same 1e-7 floor as the smoothed values: resampler tails decay
-            // into denormals and would otherwise read as -150..-600 dBFS.
-            if peak >= 1e-7, peak > holdPeakBits[m].loadFloat() { holdPeakBits[m].storeFloat(peak) }
-            if rms >= 1e-7, rms > holdRMSBits[m].loadFloat() { holdRMSBits[m].storeFloat(rms) }
+            // Same 1e-7 floor as the smoothed values: resampler tails decay into
+            // denormals and would otherwise read as -150..-600 dBFS.
+            if pk >= 1e-7, pk > holdPeak[m].loadFloat() { holdPeak[m].storeFloat(pk) }
+            if rms >= 1e-7, rms > holdRMS[m].loadFloat() { holdRMS[m].storeFloat(rms) }
+        }
+        for m in 0..<meterCount {
+            update(m, col: m * 2, smoothPeak: &smoothPeakL, smoothRMS: &smoothRMSL,
+                   peakBits: peakLBits, rmsBits: rmsLBits, holdPeak: holdPeakLBits, holdRMS: holdRMSLBits)
+            update(m, col: m * 2 + 1, smoothPeak: &smoothPeakR, smoothRMS: &smoothRMSR,
+                   peakBits: peakRBits, rmsBits: rmsRBits, holdPeak: holdPeakRBits, holdRMS: holdRMSRBits)
         }
     }
 

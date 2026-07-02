@@ -31,6 +31,10 @@ public struct CaptureCtx {
     public var tapGainWord: UnsafeMutablePointer<UInt64>
     public var inputGainWord: UnsafeMutablePointer<UInt64>
 
+    // Monitor selection: packed (Int32 busIndex, Float linear-gain) word
+    // (F-M1/M2). busIndex < 0 == off. Single aligned load in the callback.
+    public var monitorWord: UnsafeMutablePointer<UInt64>
+
     // Scratch buffers (preallocated, stereo interleaved).
     public var tapScratch: UnsafeMutablePointer<Float>    // per-frame source stereo
     public var inputScratch: UnsafeMutablePointer<Float>
@@ -60,7 +64,27 @@ public struct CaptureCtx {
 
 @inline(__always)
 public func captureProcess(_ ctxPtr: UnsafeMutablePointer<CaptureCtx>,
-                           _ inInputData: UnsafePointer<AudioBufferList>) {
+                           _ inInputData: UnsafePointer<AudioBufferList>,
+                           _ outOutputData: UnsafeMutablePointer<AudioBufferList>?) {
+    // --- Monitoring (F-M1/M2). The aggregate's main sub-device IS the real
+    // default output, so writing the selected bus mix into THIS callback's
+    // output ABL passes it through on the same clock (no SRC, no extra IOProc).
+    // Read the packed snapshot with a single aligned load; zero every output
+    // buffer up front so we never leak stale samples into the output device
+    // when monitoring is off or the selected bus is absent. The monitor mix (if
+    // any) is written into channels 0/1 during the bus fan-out pass below.
+    let (monBus, monGain) = unpackMonitor(ctxPtr.pointee.monitorWord.pointee)
+    var outList: UnsafeMutableAudioBufferListPointer? = nil
+    if let outOutputData {
+        let ol = UnsafeMutableAudioBufferListPointer(outOutputData)
+        var bi = 0
+        while bi < ol.count {
+            if let d = ol[bi].mData { memset(d, 0, Int(ol[bi].mDataByteSize)) }
+            bi += 1
+        }
+        outList = ol
+    }
+
     let bufs = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
     let nbuf = bufs.count
     let tapIdx = ctxPtr.pointee.tapBufIndex
@@ -192,6 +216,52 @@ public func captureProcess(_ ctxPtr: UnsafeMutablePointer<CaptureCtx>,
                    src: busAccum,
                    frames: n)
         bc.pointee.producerCallbacks.pointee = bc.pointee.producerCallbacks.pointee &+ 1
+
+        // Monitor pass-through: if this is the selected bus, write its stereo
+        // mix (already fade/route-applied in busAccum) into the output device,
+        // scaled by the monitor gain. Untouched channels keep the zero we wrote
+        // up front. The tap excludes our own process, so this write is never
+        // re-captured (no howl loop). Handles the two output ABL layouts
+        // defensively: interleaved (buffer 0 with >=2 ch) and non-interleaved
+        // (one mono buffer per channel); a genuinely mono device gets L+R.
+        if monBus >= 0, Int(monBus) == b, let ol = outList, ol.count > 0, let od0 = ol[0].mData {
+            let ch0 = Int(ol[0].mNumberChannels)
+            if ch0 >= 2 {
+                // Interleaved stereo (or more) in buffer 0.
+                let outFrames = Int(ol[0].mDataByteSize) / (ch0 * MemoryLayout<Float>.size)
+                let m = min(n, outFrames)
+                let op = od0.assumingMemoryBound(to: Float.self)
+                var f = 0
+                while f < m {
+                    op[f * ch0]     = busAccum[f * 2]     * monGain
+                    op[f * ch0 + 1] = busAccum[f * 2 + 1] * monGain
+                    f += 1
+                }
+            } else if ch0 == 1, ol.count >= 2, Int(ol[1].mNumberChannels) == 1, let od1 = ol[1].mData {
+                // Non-interleaved stereo: L -> buffer 0, R -> buffer 1.
+                let f0 = Int(ol[0].mDataByteSize) / MemoryLayout<Float>.size
+                let f1 = Int(ol[1].mDataByteSize) / MemoryLayout<Float>.size
+                let m = min(n, min(f0, f1))
+                let lp = od0.assumingMemoryBound(to: Float.self)
+                let rp = od1.assumingMemoryBound(to: Float.self)
+                var f = 0
+                while f < m {
+                    lp[f] = busAccum[f * 2]     * monGain
+                    rp[f] = busAccum[f * 2 + 1] * monGain
+                    f += 1
+                }
+            } else if ch0 == 1 {
+                // Genuinely mono output device: downmix L+R.
+                let outFrames = Int(ol[0].mDataByteSize) / MemoryLayout<Float>.size
+                let m = min(n, outFrames)
+                let op = od0.assumingMemoryBound(to: Float.self)
+                var f = 0
+                while f < m {
+                    op[f] = (busAccum[f * 2] + busAccum[f * 2 + 1]) * 0.5 * monGain
+                    f += 1
+                }
+            }
+        }
         b += 1
     }
 
@@ -210,6 +280,11 @@ public final class CaptureGraph {
     private let ioProcID: AudioDeviceIOProcID
     public let format: AudioStreamBasicDescription
     public let compGain: Float
+    /// True when this graph's tap excludes our own process (feedback guard is
+    /// active). False only in the rare degraded case where the HAL had not yet
+    /// minted our process object at build time (system taps only). Per-PID taps
+    /// are always safe (own process asserted absent) and report true.
+    public let selfExcluded: Bool
 
     private let ctxPtr: UnsafeMutablePointer<CaptureCtx>
     private let tapScratch: UnsafeMutablePointer<Float>
@@ -224,6 +299,7 @@ public final class CaptureGraph {
                  ioProcID: AudioDeviceIOProcID,
                  format: AudioStreamBasicDescription,
                  compGain: Float,
+                 selfExcluded: Bool,
                  ctxPtr: UnsafeMutablePointer<CaptureCtx>,
                  tapScratch: UnsafeMutablePointer<Float>,
                  inputScratch: UnsafeMutablePointer<Float>,
@@ -234,6 +310,7 @@ public final class CaptureGraph {
         self.ioProcID = ioProcID
         self.format = format
         self.compGain = compGain
+        self.selfExcluded = selfExcluded
         self.ctxPtr = ctxPtr
         self.tapScratch = tapScratch
         self.inputScratch = inputScratch
@@ -251,14 +328,37 @@ public final class CaptureGraph {
                              captureCycles: UnsafeMutablePointer<UInt64>,
                              monRing: MonitorRing,
                              params: MixParamsStore,
+                             monitorWord: UnsafeMutablePointer<UInt64>,
                              maxFrames: Int,
                              fadeFrames: Int) throws -> CaptureGraph {
-        // 1. Tap description.
+        // 1. Tap description. Feedback guard (docs/plan.md Phase 3): every tap
+        // MUST exclude our own process so the monitor pass-through we write to
+        // the output device is never re-captured into the tap (howl loop).
+        let ownProc = AudioProcessCatalog.ownProcessObject()
         let description: CATapDescription
+        var selfExcluded = false
         switch mode {
         case .system:
-            description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+            // System-wide: use the exclude-list variant with our own process
+            // object. If the HAL has not yet minted a process object for us
+            // (ownProc == 0 — no audio produced yet), warn: this cycle cannot
+            // self-exclude. In the normal Engine flow the bus consumer IOProcs
+            // are already running before the tap is built, so ownProc resolves.
+            if ownProc != 0 {
+                description = CATapDescription(stereoGlobalTapButExcludeProcesses: [ownProc])
+                selfExcluded = true
+                OALog.info("System tap excludes own process (pid \(getpid()), process object \(ownProc)) — monitor feedback guard active.")
+            } else {
+                OALog.warn("Own audio process object not yet available; system tap built WITHOUT self-exclusion this cycle (monitor feedback guard degraded).")
+                description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+            }
         case .processes(let objs):
+            // Per-PID: assert our own process is never in the capture set.
+            if ownProc != 0, objs.contains(ownProc) {
+                throw OAError("Refusing to tap our own process (feedback guard).")
+            }
+            // Per-PID taps never include our process, so they are feedback-safe.
+            selfExcluded = true
             description = CATapDescription(stereoMixdownOfProcesses: objs)
         }
         description.name = "OpenAudio-Engine-Tap"
@@ -392,6 +492,7 @@ public final class CaptureGraph {
                 compGain: compGain,
                 tapGainWord: params.tapWordPointer,
                 inputGainWord: params.inputWordPointer,
+                monitorWord: monitorWord,
                 tapScratch: tapScratch,
                 inputScratch: inputScratch,
                 busAccum: busAccum,
@@ -407,8 +508,8 @@ public final class CaptureGraph {
                 fadeRemaining: fadeFrames))
 
             // 7. IOProc capturing all source streams in one callback.
-            let block: AudioDeviceIOBlock = { (_, inInputData, _, _, _) in
-                captureProcess(ctxPtr, inInputData)
+            let block: AudioDeviceIOBlock = { (_, inInputData, _, outOutputData, _) in
+                captureProcess(ctxPtr, inInputData, outOutputData)
             }
             var ioProcID: AudioDeviceIOProcID?
             do {
@@ -429,7 +530,8 @@ public final class CaptureGraph {
 
             let graph = CaptureGraph(
                 tapID: tapID, aggregateID: aggregateID, ioProcID: ioProcID,
-                format: format, compGain: compGain, ctxPtr: ctxPtr,
+                format: format, compGain: compGain, selfExcluded: selfExcluded,
+                ctxPtr: ctxPtr,
                 tapScratch: tapScratch, inputScratch: inputScratch,
                 busAccum: busAccum, mon: mon)
             teardownOwns = true

@@ -120,7 +120,36 @@ Tools/Sources/
 2. `openaudio run --tap-system --buses 2` で各バスを `probe-vdev` し、ルーティングどおりの音が録れること。
 3. 実行中に route/バス数を変更してアンダーラン・グリッチが出ないこと（統計で確認）。
 
+## Phase 3 — UI・モニタリング
+
+対応要件: F-U1〜U6, F-M1/M2, F-E4（チャンネル単位メーター）/ 受け入れ基準 Phase 3「非開発者が説明書なしでソース選択→録音→モニタリングまで到達できる」
+
+### 構成
+
+```
+Tools/Sources/
+├── OpenAudioEngine/    # 拡張: モニタリング・ControlPlane 移設・プロセス一覧・L/R メーター
+└── OpenAudioApp/       # SwiftUI アプリ（MenuBarExtra + メインウィンドウ）
+scripts/build-app.sh    # .app バンドル組み立て（Info.plist + ad-hoc 署名）
+```
+
+### 設計判断
+
+- **モニタリング（F-M1/M2）**: キャプチャ aggregate の main sub-device は default output そのものなので、キャプチャ IOProc の **output バッファに選択バスのミックスを書き込む**方式を採る。同一クロック・SRC 不要・追加 IOProc 不要で最短レイテンシ。API: `setMonitor(busIndex: Int?, gainDB: Float)`。
+- **フィードバック防止**: tap（システム全体/プロセス指定とも）は**自プロセスを必ず除外**（モニタ出力が再捕捉される帰還ループを断つ）。
+- **ControlPlane はライブラリへ移設**（App からデバイス数制御を使うため）。CLI は移設先を import。
+- **プロセス一覧 API（F-U3）**: tapcapture の実装をエンジンライブラリへ移植し public 化。
+- **ソース変更はエンジン再起動で実現**（v1 簡素化。タップ PID のライブ差し替えは将来）。
+- **メーターは L/R 独立で公開**（F-U4。従来は max(L,R) のみ）。
+- **UI**: メニューバー常駐（LSUIElement）+ メインウィンドウ。ウィンドウは 3 ペイン: ソース（プロセス選択・gain/mute/pan）→ ルーティンググラフ（Canvas でノード・エッジ描画、クリックで route 切替、バス追加は制御プレーン連動）→ バス（L/R メーター・モニタートグル・録音）。
+- **配布形態（開発中）**: `scripts/build-app.sh` が OpenAudio.app を組み立て（NSAudioCaptureUsageDescription / NSMicrophoneUsageDescription / LSUIElement、ad-hoc 署名）。正式署名・notarization は Phase 4。
+
+### 検証手順
+
+1. `scripts/build-app.sh` → OpenAudio.app 起動 → メニューバー出現 → ウィンドウでソース選択 → 録音 → モニタリング ON（人手確認）。
+2. モニタリング ON + システム全体 tap でハウリング（帰還）が起きないこと。
+3. 受け入れ基準の非開発者テストは手動。
+
 ## 以降のフェーズ（本計画のスコープ外）
 
-- Phase 3: SwiftUI UI（ノードグラフ、メーター、ソース別 gain、モニタリング、メニューバー常駐）
 - Phase 4: 署名・notarization・インストーラ

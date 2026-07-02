@@ -24,5 +24,10 @@ let package = Package(
             dependencies: ["OpenAudioEngine"],
             path: "Sources/openaudio"
         ),
+        .executableTarget(
+            name: "OpenAudioApp",
+            dependencies: ["OpenAudioEngine"],
+            path: "Sources/OpenAudioApp"
+        ),
     ]
 )

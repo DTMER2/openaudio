@@ -68,9 +68,12 @@ public struct BusStats {
 }
 
 public struct EngineStats {
-    public var busMixPeakDB: Float     // full (pre-routing) mix meter
+    public var busMixPeakDB: Float     // full (pre-routing) mix meter (max L/R)
     public var busMixRMSDB: Float
-    public var sources: [SourceMeter]
+    public var sources: [SourceMeter]  // mono (max L/R) summaries, back-compat
+    // Per-channel (L/R) meters (F-U4): full pre-routing mix + per source.
+    public var busMixStereo: StereoMeter
+    public var sourcesStereo: [StereoMeter]
     public var buses: [BusStats]
     public var producedFrames: UInt64
     public var watchdogEvents: UInt64
@@ -94,6 +97,11 @@ public final class Engine: @unchecked Sendable {
     private var buses: [Bus?]
     private let routingWord = Atomic64(0)
     private let captureCycles = Atomic64(0)
+
+    // Monitor selection (F-M1/M2): packed (Int32 busIndex, Float linear-gain).
+    // Default off (bus -1). Owned here and passed by pointer to every capture
+    // graph so the setting survives watchdog / device-change rebuilds.
+    private let monitorWord = Atomic64(packMonitor(bus: -1, gain: 1))
 
     private var captureGraph: CaptureGraph?
 
@@ -192,7 +200,7 @@ public final class Engine: @unchecked Sendable {
                 mode: config.tapMode, inputDeviceUID: config.inputDeviceUID,
                 busSlots: busSlots, maxBuses: kOpenAudioMaxBuses,
                 routingWord: routingWord.raw, captureCycles: captureCycles.raw,
-                monRing: monitorRing, params: params,
+                monRing: monitorRing, params: params, monitorWord: monitorWord.raw,
                 maxFrames: maxFrames, fadeFrames: fadeFrames)
         } catch {
             for i in 0..<kOpenAudioMaxBuses {
@@ -282,6 +290,45 @@ public final class Engine: @unchecked Sendable {
         }
     }
 
+    /// Route a bus's stereo mix to the real default output device for
+    /// monitoring (F-M1/M2), or turn monitoring off. `busIndex` is 0-based;
+    /// pass nil (or an out-of-range index) to disable. `gainDB` is applied as a
+    /// linear factor on the monitor path only. Off-RT: the capture callback
+    /// picks up the new packed snapshot atomically on its next cycle. The
+    /// selection is stored on the engine and survives capture rebuilds.
+    public func setMonitor(busIndex: Int?, gainDB: Float) {
+        controlQueue.sync {
+            if let b = busIndex, b >= 0, b < kOpenAudioMaxBuses {
+                // Feedback safety: never enable monitoring while the current
+                // capture graph's tap lacks self-exclusion (the rare degraded
+                // build where our process object was not yet available). Rebuild
+                // first — bus consumer IOProcs are running now, so the rebuild
+                // resolves our process object and excludes it.
+                if let g = captureGraph, !g.selfExcluded, !stopping {
+                    OALog.warn("Current tap lacks self-exclusion; rebuilding before enabling monitor (feedback guard).")
+                    rebuildCapture(reason: "self-exclusion required for monitoring")
+                }
+                let gain = powf(10, gainDB / 20)
+                monitorWord.store(packMonitor(bus: Int32(b), gain: gain))
+                OALog.info(String(format: "Monitor -> bus %d @ %+.1f dB", b + 1, gainDB))
+            } else {
+                if let b = busIndex {
+                    OALog.warn("Monitor bus index out of range (\(b + 1)); monitoring off.")
+                }
+                monitorWord.store(packMonitor(bus: -1, gain: 1))
+                OALog.info("Monitor off.")
+            }
+        }
+    }
+
+    /// Current monitor selection: (0-based bus index or nil if off, gain dB).
+    public func monitorSelection() -> (busIndex: Int?, gainDB: Float) {
+        let (bus, gain) = unpackMonitor(monitorWord.load())
+        if bus < 0 { return (nil, 0) }
+        let db = gain > 0 ? 20 * log10f(gain) : -Float.infinity
+        return (Int(bus), db)
+    }
+
     // MARK: Runtime bus attach / detach (off-RT)
 
     public func attachBus(_ index: Int) throws {
@@ -340,7 +387,7 @@ public final class Engine: @unchecked Sendable {
     // MARK: Stats
 
     public func stats() -> EngineStats {
-        let (bus, srcs) = monitor.meters()
+        let (bus, srcs) = monitor.stereoMeters()
         // `buses` is mutated on controlQueue (attach/detach); snapshot the bus
         // stats there so this can be called from the stdin / stats-timer
         // threads without racing an Array mutation.
@@ -366,7 +413,9 @@ public final class Engine: @unchecked Sendable {
         return EngineStats(
             busMixPeakDB: bus.peakDB,
             busMixRMSDB: bus.rmsDB,
-            sources: srcs,
+            sources: srcs.map { $0.mono },
+            busMixStereo: bus,
+            sourcesStereo: srcs,
             buses: busStats,
             producedFrames: produced,
             watchdogEvents: watchdogEvents.load(),
@@ -387,7 +436,7 @@ public final class Engine: @unchecked Sendable {
                 mode: config.tapMode, inputDeviceUID: config.inputDeviceUID,
                 busSlots: busSlots, maxBuses: kOpenAudioMaxBuses,
                 routingWord: routingWord.raw, captureCycles: captureCycles.raw,
-                monRing: monitorRing, params: params,
+                monRing: monitorRing, params: params, monitorWord: monitorWord.raw,
                 maxFrames: maxFrames, fadeFrames: fadeFrames)
             lastProduced = captureCycles.load()
             monitor.resetSilenceBaseline()

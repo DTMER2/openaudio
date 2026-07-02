@@ -22,6 +22,8 @@ struct RunOptions {
     var silenceWindow: Double = 10.0
     var busCount: Int = 1
     var routes: [RouteSpec] = []  // empty => all sources -> bus 1
+    var monitorBus: Int?          // 0-based; nil => monitoring off
+    var monitorGainDB: Float = 0
 }
 
 enum ParsedCommand {
@@ -29,6 +31,7 @@ enum ParsedCommand {
     case probeVDev(output: String, duration: Double?, deviceUID: String)
     case buses(count: Int?)       // nil => read/list; non-nil => set then list
     case devices
+    case processes
     case help
 }
 
@@ -45,6 +48,7 @@ enum CLI {
       openaudio buses [N]
       openaudio probe-vdev -o <out.caf> [--duration <sec>] [--device <uid>]
       openaudio devices
+      openaudio processes
       openaudio --help
 
     COMMANDS:
@@ -55,6 +59,7 @@ enum CLI {
                     the Phase 2 driver for setting; fails clearly on older drivers.
       probe-vdev    Open the virtual device INPUT (ch 0/1) and record it to CAF (end-to-end proof).
       devices       List output/input devices (id, UID, name, in/out ch, rate).
+      processes     List audio-capable processes (pid, output-active, name, bundle ID) (F-U3).
 
     RUN OPTIONS:
       --tap-pid <pid>       Tap this process output (repeatable).
@@ -66,6 +71,8 @@ enum CLI {
       --gain tap=<dB>       Tap gain in dB (default 0).
       --gain input=<dB>     Input gain in dB (default 0).
       --pan tap=<-1..1>     Tap stereo balance (equal-power), -1 L .. +1 R.
+      --monitor <bus>       Pass bus (1-based) through to the default output for monitoring.
+      --monitor-gain <dB>   Monitor gain in dB (default 0). Applies to the monitor path only.
       --record <out.caf>    Record the full (pre-routing) stereo mix to a CAF file.
       --duration <sec>      Stop automatically after N seconds (default: until Ctrl-C).
       --stats-interval <s>  Stats print interval (default 2).
@@ -78,6 +85,7 @@ enum CLI {
       mute <src> on|off          Mute/unmute a source.
       attach <bus>               Attach a bus (1-based) at runtime.
       detach <bus>               Detach a bus (1-based) at runtime.
+      monitor <bus|off> [dB]     Monitor a bus (1-based) to the default output, or turn off.
       stats                      Print a stats line now.
       quit                       Stop the engine and exit.
 
@@ -98,6 +106,7 @@ enum CLI {
         case "probe-vdev": return try parseProbe(rest)
         case "buses":      return try parseBuses(rest)
         case "devices":    return .devices
+        case "processes":  return .processes
         default:
             throw CLIError("Unknown command: \(first). See --help.")
         }
@@ -166,6 +175,18 @@ enum CLI {
                 guard let pan = Float(v) else { throw CLIError("--pan value must be a number: \(args[i])") }
                 guard k == "tap" else { throw CLIError("--pan currently supports only 'tap'") }
                 o.tapPan = max(-1, min(1, pan))
+            case "--monitor":
+                i += 1
+                guard i < args.count, let b = Int(args[i]), b >= 1, b <= 8 else {
+                    throw CLIError("--monitor requires a 1-based bus index 1..8")
+                }
+                o.monitorBus = b - 1   // to 0-based
+            case "--monitor-gain":
+                i += 1
+                guard i < args.count, let db = Float(args[i]) else {
+                    throw CLIError("--monitor-gain requires a number (dB)")
+                }
+                o.monitorGainDB = db
             case "--record":
                 i += 1
                 guard i < args.count else { throw CLIError("--record requires a file path") }

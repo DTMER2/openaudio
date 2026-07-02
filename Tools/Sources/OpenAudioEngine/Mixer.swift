@@ -30,6 +30,21 @@ public func unpackGainPair(_ w: UInt64) -> (Float, Float) {
      Float(bitPattern: UInt32(truncatingIfNeeded: w)))
 }
 
+/// Monitor selection snapshot (F-M1/M2): the selected bus index (Int32; < 0 =
+/// monitoring off) and a LINEAR gain, packed into one aligned 64-bit word so
+/// the RT capture callback reads the pair with a single non-torn load — same
+/// discipline as the per-source gain words. High 32 bits = bus, low 32 = gain.
+@inline(__always)
+public func packMonitor(bus: Int32, gain: Float) -> UInt64 {
+    (UInt64(UInt32(bitPattern: bus)) << 32) | UInt64(gain.bitPattern)
+}
+
+@inline(__always)
+public func unpackMonitor(_ w: UInt64) -> (Int32, Float) {
+    (Int32(bitPattern: UInt32(truncatingIfNeeded: w >> 32)),
+     Float(bitPattern: UInt32(truncatingIfNeeded: w)))
+}
+
 /// Publishes effective per-source (L, R) gains as atomic packed words.
 public final class MixParamsStore: @unchecked Sendable {
     private let tapWord: Atomic64
