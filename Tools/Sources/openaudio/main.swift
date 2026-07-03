@@ -1,0 +1,418 @@
+// main.swift
+// Entry point for the `openaudio` CLI: dispatches run / probe-vdev / devices,
+// installs a clean-shutdown signal handler, and prints periodic engine stats.
+
+import Foundation
+import CoreAudio
+import AudioToolbox
+import OpenAudioEngine
+import Darwin
+
+// Retained for the process lifetime.
+var activeEngine: Engine?
+var signalSource: DispatchSourceSignal?
+
+// MARK: - PID -> Core Audio process object
+
+func processObject(forPID pid: pid_t) throws -> AudioObjectID {
+    var addr = CAProperty.address(kAudioHardwarePropertyTranslatePIDToProcessObject)
+    var inPID = pid
+    var obj: AudioObjectID = 0
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    try check(
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr,
+                                   UInt32(MemoryLayout<pid_t>.size), &inPID, &size, &obj),
+        "TranslatePIDToProcessObject(pid: \(pid))")
+    if obj == 0 { throw OAError("No Core Audio process object for PID \(pid) (running / producing audio?)") }
+    return obj
+}
+
+// MARK: - devices
+
+func runDevices() {
+    let devices = DeviceUtil.allDevices()
+    func pad(_ s: String, _ w: Int) -> String {
+        let t = s.count > w - 1 ? String(s.prefix(w - 1)) : s
+        return t + String(repeating: " ", count: max(0, w - t.count))
+    }
+    print(pad("ID", 6) + pad("IN", 4) + pad("OUT", 5) + pad("RATE", 8) + pad("NAME", 28) + "UID")
+    print(String(repeating: "-", count: 90))
+    for d in devices {
+        print(pad(String(d.id), 6) + pad(String(d.inChannels), 4) + pad(String(d.outChannels), 5)
+              + pad(String(Int(d.sampleRate)), 8) + pad(d.name, 28) + d.uid)
+    }
+}
+
+// MARK: - run
+
+func runEngine(_ o: RunOptions) throws {
+    OALog.info("Preparing engine. If macOS prompts for audio-capture permission, approve it for the terminal.")
+
+    let tapMode: EngineTapMode
+    if o.tapSystem {
+        tapMode = .system
+        OALog.info("Tap mode: system-wide.")
+    } else {
+        var objs: [AudioObjectID] = []
+        for pid in o.tapPIDs {
+            let obj = try processObject(forPID: pid)
+            OALog.info("Tapping PID \(pid) -> process object \(obj)")
+            objs.append(obj)
+        }
+        // CLI taps exactly the PIDs given: one single-object lane per PID.
+        tapMode = .processes(objs.map { [$0] })
+    }
+
+    // Each tapped PID is its own lane now; the CLI's single --gain / --pan /
+    // "tap" commands apply to every tap lane uniformly.
+    let laneCount: Int
+    switch tapMode {
+    case .system:               laneCount = 1
+    case .processes(let lanes): laneCount = max(1, lanes.count)
+    }
+
+    var cfg = EngineConfig(tapMode: tapMode)
+    cfg.inputDeviceUID = o.inputSpec
+    cfg.recordURL = o.recordPath.map { URL(fileURLWithPath: $0) }
+    cfg.silenceWindow = o.silenceWindow
+    cfg.tapGainsDB = Array(repeating: o.tapGainDB, count: laneCount)
+    cfg.tapPans = Array(repeating: o.tapPan, count: laneCount)
+    cfg.inputGainDB = o.inputGainDB
+    cfg.busCount = o.busCount
+    cfg.outputMode = o.singleDevice ? .single16ch : .separateDevices
+    cfg.routes = o.routes.flatMap { spec -> [EngineRoute] in
+        if spec.source == "input" { return [EngineRoute(source: .input, buses: spec.buses)] }
+        return (0..<laneCount).map { EngineRoute(source: .tap($0), buses: spec.buses) }
+    }
+
+    let engine = try Engine(config: cfg)
+    try engine.start()
+    activeEngine = engine
+
+    // Apply requested monitoring (F-M1/M2) once buses are attached.
+    if let mbus = o.monitorBus {
+        engine.setMonitor(busIndex: mbus, gainDB: o.monitorGainDB)
+    }
+
+    // Clean finalize on Ctrl-C.
+    signal(SIGINT, SIG_IGN)
+    let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    sig.setEventHandler {
+        OALog.info("SIGINT received — stopping engine...")
+        activeEngine?.stop()
+        exit(0)
+    }
+    sig.resume()
+    signalSource = sig
+
+    // Periodic stats.
+    let statsTimer = DispatchSource.makeTimerSource(queue: .main)
+    statsTimer.schedule(deadline: .now() + o.statsInterval, repeating: o.statsInterval)
+    statsTimer.setEventHandler { printStats(engine) }
+    statsTimer.resume()
+
+    // Interactive stdin command loop on a background thread.
+    startInteractive(engine, statsTimer: statsTimer)
+
+    if let d = o.duration {
+        OALog.info(String(format: "Will stop automatically after %.1f s.", d))
+        DispatchQueue.main.asyncAfter(deadline: .now() + d) {
+            OALog.info("Duration reached — stopping engine...")
+            statsTimer.cancel()
+            activeEngine?.stop()
+            exit(0)
+        }
+    } else {
+        OALog.info("Running until Ctrl-C (or `quit` on stdin).")
+    }
+    dispatchMain()
+}
+
+func dbStr(_ v: Float) -> String { v.isFinite ? String(format: "%.1f", v) : "-inf" }
+
+func printStats(_ engine: Engine) {
+    let s = engine.stats()
+    // Per-channel (L/R) meters (F-U4): "pk L/R rms L/R".
+    func meterStr(_ m: StereoMeter) -> String {
+        String(format: "pk %@/%@ rms %@/%@",
+               dbStr(m.peakL), dbStr(m.peakR), dbStr(m.rmsL), dbStr(m.rmsR))
+    }
+    var srcStr = ""
+    for m in s.sourcesStereo {
+        srcStr += String(format: " %@[%@]", m.name, meterStr(m))
+    }
+    var busStr = ""
+    for b in s.buses {
+        busStr += String(format: " b%d[fill %d (%.0f%%) %+.1fppm u%llu o%llu c%llu]",
+                         b.index + 1, b.fillFrames, b.fillPct, b.ratioPPM,
+                         b.underruns, b.overruns, b.consumerCallbacks)
+    }
+    let (monBus, monGain) = engine.monitorSelection()
+    let monStr = monBus.map { String(format: "b%d %+.1fdB", $0 + 1, monGain) } ?? "off"
+    let line = String(format: "mix[%@]%@ |%@ | route %@ | mon %@ | wdog %llu",
+                      meterStr(s.busMixStereo), srcStr, busStr,
+                      engine.routingDescription(), monStr, s.watchdogEvents)
+    OALog.info(line)
+}
+
+/// Reads stdin lines on a background thread and applies live commands.
+func startInteractive(_ engine: Engine, statsTimer: DispatchSourceTimer) {
+    let t = Thread {
+        while let line = readLine(strippingNewline: true) {
+            let toks = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            guard let cmd = toks.first?.lowercased() else { continue }
+            let args = Array(toks.dropFirst())
+            do {
+                try handleCommand(engine, cmd, args, statsTimer: statsTimer)
+            } catch let e as OAError {
+                OALog.error("command failed: \(e.description)")
+            } catch {
+                OALog.error("command failed: \(error)")
+            }
+        }
+        // stdin closed (EOF): leave the engine running (matches Ctrl-C model);
+        // duration/SIGINT still govern shutdown.
+    }
+    t.name = "OpenAudio.CLI.stdin"
+    t.start()
+}
+
+/// "tap" -> every tap lane, "tapN" -> lane N (1-based), "input" -> input.
+func parseSources(_ s: String, engine: Engine) throws -> [EngineSource] {
+    let lower = s.lowercased()
+    if lower == "tap" { return (0..<engine.tapLaneCount).map { .tap($0) } }
+    if lower == "input" { return [.input] }
+    if lower.hasPrefix("tap"), let n = Int(lower.dropFirst(3)), n >= 1, n <= engine.tapLaneCount {
+        return [.tap(n - 1)]
+    }
+    throw OAError("source must be 'tap', 'tapN' (1...\(engine.tapLaneCount)) or 'input': \(s)")
+}
+
+func parseOnOff(_ s: String) throws -> Bool {
+    switch s.lowercased() {
+    case "on", "1", "true":   return true
+    case "off", "0", "false": return false
+    default: throw OAError("expected on|off: \(s)")
+    }
+}
+
+func handleCommand(_ engine: Engine, _ cmd: String, _ args: [String],
+                   statsTimer: DispatchSourceTimer) throws {
+    switch cmd {
+    case "route":
+        guard args.count == 3 else { throw OAError("usage: route <src> <bus> on|off") }
+        let srcs = try parseSources(args[0], engine: engine)
+        guard let bus1 = Int(args[1]), bus1 >= 1 else { throw OAError("bus must be a 1-based integer") }
+        let on = try parseOnOff(args[2])
+        for src in srcs { try engine.setRoute(src, bus: bus1 - 1, on: on) }
+        OALog.info("route \(args[0]) \(bus1) \(on ? "on" : "off") -> \(engine.routingDescription())")
+    case "gain":
+        guard args.count == 2, let db = Float(args[1]) else { throw OAError("usage: gain <src> <dB>") }
+        for src in try parseSources(args[0], engine: engine) { engine.setGain(src, dB: db) }
+        OALog.info("gain \(args[0]) = \(db) dB")
+    case "pan":
+        guard args.count == 2, let v = Float(args[1]) else { throw OAError("usage: pan <src> <-1..1>") }
+        for src in try parseSources(args[0], engine: engine) { engine.setPan(src, max(-1, min(1, v))) }
+        OALog.info("pan \(args[0]) = \(max(-1, min(1, v)))")
+    case "mute":
+        guard args.count == 2 else { throw OAError("usage: mute <src> on|off") }
+        let on = try parseOnOff(args[1])
+        for src in try parseSources(args[0], engine: engine) { engine.setMute(src, on) }
+        OALog.info("mute \(args[0]) \(on ? "on" : "off")")
+    case "attach":
+        guard args.count == 1, let bus1 = Int(args[0]), bus1 >= 1 else { throw OAError("usage: attach <bus>") }
+        try engine.attachBus(bus1 - 1)
+        OALog.info("attached bus \(bus1); attached: \(engine.attachedBusIndices().map { $0 + 1 })")
+    case "detach":
+        guard args.count == 1, let bus1 = Int(args[0]), bus1 >= 1 else { throw OAError("usage: detach <bus>") }
+        try engine.detachBus(bus1 - 1)
+        OALog.info("detached bus \(bus1); attached: \(engine.attachedBusIndices().map { $0 + 1 })")
+    case "monitor":
+        guard args.count >= 1 else { throw OAError("usage: monitor <bus|off> [gainDB]") }
+        if args[0].lowercased() == "off" {
+            engine.setMonitor(busIndex: nil, gainDB: 0)
+            OALog.info("monitor off")
+        } else {
+            guard let bus1 = Int(args[0]), bus1 >= 1 else { throw OAError("monitor bus must be a 1-based integer or 'off'") }
+            var db: Float = 0
+            if args.count >= 2 {
+                guard let g = Float(args[1]) else { throw OAError("monitor gain must be a number (dB)") }
+                db = g
+            }
+            engine.setMonitor(busIndex: bus1 - 1, gainDB: db)
+            OALog.info("monitor bus \(bus1) @ \(db) dB")
+        }
+    case "stats":
+        printStats(engine)
+    case "quit", "exit", "q":
+        OALog.info("quit received — stopping engine...")
+        statsTimer.cancel()
+        activeEngine?.stop()
+        exit(0)
+    default:
+        OALog.warn("unknown command '\(cmd)' (route|gain|pan|mute|attach|detach|monitor|stats|quit)")
+    }
+}
+
+// MARK: - buses (control plane)
+
+func runBuses(count: Int?) throws {
+    if let n = count {
+        OALog.info("Setting driver device count to \(n) via control plane...")
+        let applied = try OpenAudioControlPlane.setDeviceCount(n)
+        OALog.info("Device count set to \(applied); HAL device list settled.")
+    } else {
+        let current = try OpenAudioControlPlane.deviceCount()
+        OALog.info("Current driver device count: \(current)")
+    }
+    // List the resulting OpenAudio devices.
+    let devices = DeviceUtil.allDevices().filter { $0.uid.hasPrefix("OpenAudioDevice-") }
+    if devices.isEmpty {
+        print("(no OpenAudio devices present)")
+        return
+    }
+    func pad(_ s: String, _ w: Int) -> String {
+        let t = s.count > w - 1 ? String(s.prefix(w - 1)) : s
+        return t + String(repeating: " ", count: max(0, w - t.count))
+    }
+    print(pad("ID", 6) + pad("IN", 4) + pad("OUT", 5) + pad("RATE", 8) + pad("NAME", 28) + "UID")
+    print(String(repeating: "-", count: 70))
+    for d in devices.sorted(by: { $0.uid < $1.uid }) {
+        print(pad(String(d.id), 6) + pad(String(d.inChannels), 4) + pad(String(d.outChannels), 5)
+              + pad(String(Int(d.sampleRate)), 8) + pad(d.name, 28) + d.uid)
+    }
+}
+
+// MARK: - processes (F-U3)
+
+func runProcesses() throws {
+    let infos = try AudioProcessCatalog.listAudioProcesses()
+    guard !infos.isEmpty else { print("No audio process objects found."); return }
+    func pad(_ s: String, _ w: Int) -> String {
+        let t = s.count > w - 1 ? String(s.prefix(w - 1)) : s
+        return t + String(repeating: " ", count: max(0, w - t.count))
+    }
+    print(pad("PID", 8) + pad("OUTPUT", 8) + pad("NAME", 30) + "BUNDLE ID")
+    print(String(repeating: "-", count: 78))
+    for i in infos {
+        print(pad(String(i.pid), 8) + pad(i.isRunningOutput ? "yes" : "-", 8)
+              + pad(i.name, 30) + (i.bundleID ?? ""))
+    }
+    let active = infos.filter { $0.isRunningOutput }.count
+    FileHandle.standardError.write(Data(
+        "\n\(infos.count) process objects, \(active) currently producing output.\n".utf8))
+}
+
+// MARK: - probe-vdev
+
+/// Opens the virtual device's INPUT (channels 0/1) with its own IOProc and
+/// records to CAF. Independent, second-process proof of the end-to-end path.
+func runProbe(output: String, duration: Double?, deviceUID: String = "OpenAudioDevice-1",
+              pair: Int = 1) throws {
+    let uid = deviceUID
+    let dev = DeviceUtil.device(forUID: uid)
+    guard dev != 0 else { throw OAError("Virtual device '\(uid)' not found.") }
+    let rate = DeviceUtil.nominalSampleRate(dev)
+    let sr = rate > 0 ? rate : 48000
+    let dur = duration ?? 15.0
+    let chOff = (pair - 1) * 2
+    OALog.info(String(format: "probe-vdev: recording virtual device input ch%d/%d for %.1f s @ %.0f Hz -> %@",
+                      chOff + 1, chOff + 2, dur, sr, output))
+
+    // Preallocated capture buffer (stereo), filled by the RT IOProc via memcpy.
+    let capacityFrames = Int(sr * (dur + 1.0))
+    let buffer = UnsafeMutablePointer<Float>.allocate(capacity: capacityFrames * 2)
+    buffer.initialize(repeating: 0, count: capacityFrames * 2)
+    defer { buffer.deallocate() }
+    let offset = UnsafeMutablePointer<Int>.allocate(capacity: 1); offset.pointee = 0
+    defer { offset.deallocate() }
+
+    let block: AudioDeviceIOBlock = { (_, inInputData, _, _, _) in
+        let inList = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
+        guard inList.count > 0, let raw = inList[0].mData else { return }
+        let ch = Int(inList[0].mNumberChannels)
+        if ch <= 0 { return }
+        let frames = Int(inList[0].mDataByteSize) / (ch * MemoryLayout<Float>.size)
+        if ch < chOff + 2 { return }
+        let src = raw.assumingMemoryBound(to: Float.self)
+        var pos = offset.pointee
+        var i = 0
+        while i < frames && pos < capacityFrames {
+            buffer[pos * 2] = src[i * ch + chOff]
+            buffer[pos * 2 + 1] = src[i * ch + chOff + 1]
+            pos += 1; i += 1
+        }
+        offset.pointee = pos
+    }
+
+    var procID: AudioDeviceIOProcID?
+    try check(AudioDeviceCreateIOProcIDWithBlock(&procID, dev, nil, block),
+              "AudioDeviceCreateIOProcIDWithBlock(probe)")
+    guard let procID else { throw OAError("probe IOProc creation returned null") }
+    try check(AudioDeviceStart(dev, procID), "AudioDeviceStart(probe)")
+    Thread.sleep(forTimeInterval: dur)
+    AudioDeviceStop(dev, procID)
+    AudioDeviceDestroyIOProcID(dev, procID)
+
+    let framesCaptured = offset.pointee
+    if framesCaptured == 0 {
+        OALog.warn(String(format: "probe-vdev: captured 0 frames — the device may lack channels %d/%d " +
+                                  "(pair %d) or produced no input cycles.", chOff + 1, chOff + 2, pair))
+    }
+    OALog.info("probe-vdev: captured \(framesCaptured) frames; writing CAF...")
+
+    // Write to CAF (Float32 stereo).
+    var asbd = AudioStreamBasicDescription(
+        mSampleRate: sr, mFormatID: kAudioFormatLinearPCM,
+        mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+        mBytesPerPacket: 8, mFramesPerPacket: 1, mBytesPerFrame: 8,
+        mChannelsPerFrame: 2, mBitsPerChannel: 32, mReserved: 0)
+    var file: ExtAudioFileRef?
+    try check(ExtAudioFileCreateWithURL(URL(fileURLWithPath: output) as CFURL, kAudioFileCAFType,
+                                        &asbd, nil, AudioFileFlags.eraseFile.rawValue, &file),
+              "ExtAudioFileCreateWithURL(\(output))")
+    guard let file else { throw OAError("ExtAudioFileCreateWithURL returned null") }
+    defer { ExtAudioFileDispose(file) }
+    try check(ExtAudioFileSetProperty(file, kExtAudioFileProperty_ClientDataFormat,
+                                      UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &asbd),
+              "ExtAudioFileSetProperty(ClientDataFormat)")
+    if framesCaptured > 0 {
+        var abl = AudioBufferList(
+            mNumberBuffers: 1,
+            mBuffers: AudioBuffer(mNumberChannels: 2,
+                                  mDataByteSize: UInt32(framesCaptured * 2 * MemoryLayout<Float>.size),
+                                  mData: buffer))
+        try check(ExtAudioFileWrite(file, UInt32(framesCaptured), &abl), "ExtAudioFileWrite")
+    }
+    OALog.info("probe-vdev: wrote \(output)")
+}
+
+// MARK: - Dispatch
+
+let arguments = Array(CommandLine.arguments.dropFirst())
+do {
+    switch try CLI.parse(arguments) {
+    case .help:
+        print(CLI.usage); exit(0)
+    case .devices:
+        runDevices(); exit(0)
+    case .processes:
+        try runProcesses(); exit(0)
+    case .probeVDev(let out, let dur, let uid, let pair):
+        try runProbe(output: out, duration: dur, deviceUID: uid, pair: pair); exit(0)
+    case .buses(let count):
+        try runBuses(count: count); exit(0)
+    case .run(let o):
+        try runEngine(o)
+    }
+} catch let e as CLIError {
+    OALog.error(e.description)
+    FileHandle.standardError.write(Data("\nRun `openaudio --help` for usage.\n".utf8))
+    exit(1)
+} catch let e as OAError {
+    OALog.error(e.description)
+    exit(1)
+} catch {
+    OALog.error("\(error)")
+    exit(1)
+}

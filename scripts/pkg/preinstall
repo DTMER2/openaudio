@@ -1,0 +1,11 @@
+#!/bin/bash
+# preinstall (driver component pkg)
+#
+# Remove any previously installed driver bundle before the new one is laid
+# down. Installer merges files into an existing bundle; files present in an
+# old layout but not the new one would survive and invalidate the new
+# bundle's code signature.
+
+rm -rf "/Library/Audio/Plug-Ins/HAL/OpenAudioDriver.driver"
+
+exit 0
