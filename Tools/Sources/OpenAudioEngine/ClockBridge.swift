@@ -63,18 +63,21 @@ private func catmullRom(_ y0: Float, _ y1: Float, _ y2: Float, _ y3: Float, _ t:
 }
 
 /// Consumer RT entry point: fills `frames` of interleaved `channels` output
-/// (bus into channels 0/1, rest zeroed) from the bridge ring. Pure arithmetic.
-/// `channels` MUST be the actual buffer's channel count (the same value used
-/// to derive `frames` from the byte size) so memset and stride can never
-/// overrun the device buffer, even if the device layout differs from the
-/// init-time property.
+/// (bus into channels channelOffset/channelOffset+1, rest zeroed) from the
+/// bridge ring. Pure arithmetic. `channels` MUST be the actual buffer's
+/// channel count (the same value used to derive `frames` from the byte size)
+/// so memset and stride can never overrun the device buffer, even if the
+/// device layout differs from the init-time property. `channelOffset` places
+/// the stereo pair inside a wider device (16ch pair-packed mode); a buffer too
+/// narrow for the pair stays silent.
 @inline(__always)
 public func bridgeConsume(_ ctxPtr: UnsafeMutablePointer<ConsumerCtx>,
                           out: UnsafeMutablePointer<Float>,
                           frames: Int,
-                          channels: Int) {
+                          channels: Int,
+                          channelOffset: Int = 0) {
     let outCh = channels
-    if outCh < 2 || frames <= 0 { return }
+    if outCh < channelOffset + 2 || channelOffset < 0 || frames <= 0 { return }
     // Zero the whole output block up front; unfilled frames stay silent.
     memset(out, 0, frames * outCh * MemoryLayout<Float>.size)
 
@@ -171,7 +174,7 @@ public func bridgeConsume(_ ctxPtr: UnsafeMutablePointer<ConsumerCtx>,
         let i0i = Int(i0 % capacity) * 2
         let ip1 = Int((i0 &+ 1) % capacity) * 2
         let ip2 = Int((i0 &+ 2) % capacity) * 2
-        let base = j * outCh
+        let base = j * outCh + channelOffset
         // Left
         out[base] = catmullRom(storage[im1], storage[i0i], storage[ip1], storage[ip2], t)
         // Right

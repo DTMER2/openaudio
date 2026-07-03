@@ -14,16 +14,11 @@ import CoreAudio
 import AudioToolbox
 import Darwin
 
-public enum EngineSource {
-    case tap
+public enum EngineSource: Hashable {
+    /// One tap lane (0-based). Lane == one tapped app, or lane 0 for the
+    /// system-wide tap.
+    case tap(Int)
     case input
-
-    public var index: Int {
-        switch self {
-        case .tap:   return 0
-        case .input: return 1
-        }
-    }
 }
 
 /// Declarative route: a source enabled onto a set of 0-based bus indices.
@@ -42,13 +37,20 @@ public struct EngineConfig {
     public var recordURL: URL?
     public var silenceWindow: Double = 10.0
 
-    public var tapGainDB: Float = 0
+    /// Per-tap-lane display names (used for stats/meters). Padded with
+    /// "tap n" when shorter than the lane count.
+    public var tapNames: [String] = []
+    /// Per-tap-lane initial gains/pans. Missing entries default to 0.
+    public var tapGainsDB: [Float] = []
+    public var tapPans: [Float] = []
     public var inputGainDB: Float = 0
-    public var tapPan: Float = 0
     public var inputPan: Float = 0
 
     /// Number of buses to attach at start (1...kOpenAudioMaxBuses).
     public var busCount: Int = 1
+    /// Where buses land: their own stereo device each, or channel pairs of
+    /// the single 16ch device (DAW-friendly, BlackHole-16ch-style).
+    public var outputMode: BusOutputMode = .separateDevices
     /// Initial routing. If empty: every present source -> bus 0 (index 0).
     public var routes: [EngineRoute] = []
 
@@ -84,13 +86,14 @@ public struct EngineStats {
 public final class Engine: @unchecked Sendable {
     private let config: EngineConfig
     private let hasInput: Bool
+    private let numTaps: Int
     private let numSources: Int
 
     private let captureRate: Double
 
     private let monitorRing: MonitorRing
     private let monitor: Monitor
-    private let params = MixParamsStore()
+    private let params: MixParamsStore
 
     // Bus fan-out: slot array of atomic pointers (RT-observed) + owning buses.
     private let busSlots: UnsafeMutablePointer<UnsafeMutableRawPointer?>
@@ -116,12 +119,31 @@ public final class Engine: @unchecked Sendable {
 
     private let maxFrames = 8192
     private let fadeFrames: Int
+    private let sourceNames: [String]
+
+    /// Number of tap lanes (one per tapped app; 1 for the system tap).
+    public var tapLaneCount: Int { numTaps }
+
+    /// Routing-matrix index for a source, or nil if the source is not active.
+    private func sourceIndex(_ source: EngineSource) -> Int? {
+        switch source {
+        case .tap(let i):  return (i >= 0 && i < numTaps) ? i : nil
+        case .input:       return hasInput ? numTaps : nil
+        }
+    }
 
     public init(config: EngineConfig) throws {
         self.config = config
         self.hasInput = config.inputDeviceUID != nil
-        self.numSources = hasInput ? 2 : 1
+        switch config.tapMode {
+        case .system:               self.numTaps = 1
+        case .processes(let lanes): self.numTaps = max(1, lanes.count)
+        }
+        self.numSources = numTaps + (hasInput ? 1 : 0)
 
+        guard numSources <= kOpenAudioMaxSources else {
+            throw OAError("Too many sources: \(numSources) (max \(kOpenAudioMaxSources) — up to \(kOpenAudioMaxSources - 1) apps plus an input)")
+        }
         guard config.busCount >= 1 && config.busCount <= kOpenAudioMaxBuses else {
             throw OAError("busCount must be 1...\(kOpenAudioMaxBuses), got \(config.busCount)")
         }
@@ -131,8 +153,15 @@ public final class Engine: @unchecked Sendable {
         let cr = outDev != 0 ? DeviceUtil.nominalSampleRate(outDev) : 0
         self.captureRate = cr > 0 ? cr : 48000
 
+        self.params = MixParamsStore(tapCount: numTaps)
         self.monitorRing = MonitorRing(channels: 2 + 2 * numSources, capacityFrames: Int(captureRate))
-        let sourceNames = hasInput ? ["tap", "input"] : ["tap"]
+        let taps = numTaps
+        let names = config.tapNames
+        var sourceNames: [String] = (0..<taps).map { i in
+            i < names.count ? names[i] : (taps == 1 ? "tap" : "tap \(i + 1)")
+        }
+        if hasInput { sourceNames.append("input") }
+        self.sourceNames = sourceNames
         self.monitor = try Monitor(ring: monitorRing, sampleRate: captureRate,
                                    sourceNames: sourceNames, recordURL: config.recordURL)
         self.fadeFrames = max(1, Int(captureRate * 0.010))
@@ -142,8 +171,10 @@ public final class Engine: @unchecked Sendable {
         self.buses = Array(repeating: nil, count: kOpenAudioMaxBuses)
 
         // Seed user params.
-        params.tap.gainDB = config.tapGainDB
-        params.tap.pan = config.tapPan
+        for i in 0..<numTaps {
+            params.taps[i].gainDB = i < config.tapGainsDB.count ? config.tapGainsDB[i] : 0
+            params.taps[i].pan = i < config.tapPans.count ? config.tapPans[i] : 0
+        }
         params.input.gainDB = config.inputGainDB
         params.input.pan = config.inputPan
         params.publish()
@@ -154,8 +185,7 @@ public final class Engine: @unchecked Sendable {
             for s in 0..<numSources { mask |= routeBit(source: s, bus: 0) }
         } else {
             for route in config.routes {
-                let s = route.source.index
-                if s >= numSources { continue }   // input route with no input source
+                guard let s = sourceIndex(route.source) else { continue }   // inactive source
                 for bus in route.buses where bus >= 0 && bus < kOpenAudioMaxBuses {
                     mask |= routeBit(source: s, bus: bus)
                 }
@@ -180,7 +210,8 @@ public final class Engine: @unchecked Sendable {
         // 1. Attach and publish the requested buses (consumer IOProcs).
         do {
             for i in 0..<config.busCount {
-                let bus = try Bus.attach(index: i, captureRate: captureRate)
+                let bus = try Bus.attach(index: i, captureRate: captureRate,
+                                         output: config.outputMode)
                 buses[i] = bus
                 bus.publish(into: busSlots)
             }
@@ -250,8 +281,9 @@ public final class Engine: @unchecked Sendable {
     public func setGain(_ source: EngineSource, dB: Float) {
         controlQueue.sync {
             switch source {
-            case .tap:   params.tap.gainDB = dB
-            case .input: params.input.gainDB = dB
+            case .tap(let i) where i >= 0 && i < numTaps: params.taps[i].gainDB = dB
+            case .input where hasInput:                   params.input.gainDB = dB
+            default: return
             }
             params.publish()
         }
@@ -260,8 +292,9 @@ public final class Engine: @unchecked Sendable {
     public func setMute(_ source: EngineSource, _ muted: Bool) {
         controlQueue.sync {
             switch source {
-            case .tap:   params.tap.muted = muted
-            case .input: params.input.muted = muted
+            case .tap(let i) where i >= 0 && i < numTaps: params.taps[i].muted = muted
+            case .input where hasInput:                   params.input.muted = muted
+            default: return
             }
             params.publish()
         }
@@ -270,8 +303,9 @@ public final class Engine: @unchecked Sendable {
     public func setPan(_ source: EngineSource, _ pan: Float) {
         controlQueue.sync {
             switch source {
-            case .tap:   params.tap.pan = pan
-            case .input: params.input.pan = pan
+            case .tap(let i) where i >= 0 && i < numTaps: params.taps[i].pan = pan
+            case .input where hasInput:                   params.input.pan = pan
+            default: return
             }
             params.publish()
         }
@@ -281,9 +315,9 @@ public final class Engine: @unchecked Sendable {
     /// callback picks up the new matrix atomically on its next cycle.
     public func setRoute(_ source: EngineSource, bus: Int, on: Bool) throws {
         guard bus >= 0 && bus < kOpenAudioMaxBuses else { throw OAError("bus index out of range: \(bus + 1)") }
-        if source.index >= numSources { throw OAError("source 'input' is not active (no --input given)") }
+        guard let s = sourceIndex(source) else { throw OAError("source is not active: \(source)") }
         controlQueue.sync {
-            let bit = routeBit(source: source.index, bus: bus)
+            let bit = routeBit(source: s, bus: bus)
             var m = routingWord.load()
             if on { m |= bit } else { m &= ~bit }
             routingWord.store(m)
@@ -338,7 +372,8 @@ public final class Engine: @unchecked Sendable {
             if stopping { thrown = OAError("engine is stopping"); return }
             if buses[index] != nil { thrown = OAError("bus \(index + 1) already attached"); return }
             do {
-                let bus = try Bus.attach(index: index, captureRate: captureRate)
+                let bus = try Bus.attach(index: index, captureRate: captureRate,
+                                         output: config.outputMode)
                 buses[index] = bus
                 bus.publish(into: busSlots)
             } catch { thrown = error }
@@ -371,7 +406,7 @@ public final class Engine: @unchecked Sendable {
     /// Human-readable matrix, e.g. "tap->[1,2] input->[1]".
     public func routingDescription() -> String {
         let m = routingWord.load()
-        let names = hasInput ? ["tap", "input"] : ["tap"]
+        let names = sourceNames
         var parts: [String] = []
         for s in 0..<numSources {
             var bs: [Int] = []

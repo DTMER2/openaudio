@@ -276,12 +276,11 @@ static CFStringRef OA_CopyDeviceModelUID(UInt32 n)
 
 static CFStringRef OA_CopyDeviceName(UInt32 n)
 {
-    /* Device 1 keeps the pre-Phase-2 name for compatibility. */
     if(n <= 1)
     {
-        return CFStringCreateWithFormat(NULL, NULL, CFSTR("OpenAudio 16ch"));
+        return CFStringCreateWithFormat(NULL, NULL, CFSTR("OpenAudio"));
     }
-    return CFStringCreateWithFormat(NULL, NULL, CFSTR("OpenAudio 16ch %u"), (unsigned)n);
+    return CFStringCreateWithFormat(NULL, NULL, CFSTR("OpenAudio %u"), (unsigned)n);
 }
 
 static void OA_PersistDeviceCount(UInt32 count)

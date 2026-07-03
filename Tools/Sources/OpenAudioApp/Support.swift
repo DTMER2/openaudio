@@ -7,10 +7,12 @@ import CoreAudio
 
 // MARK: - Source / routing model
 
-/// The two engine source lanes (mirrors OpenAudioEngine.EngineSource without
-/// importing it into value types used by the views).
+/// A UI-facing mix source: the system-wide tap, one tapped app, or the input
+/// device. Mapped onto engine tap lanes (OpenAudioEngine.EngineSource) by
+/// AppModel using the lane order of the running engine.
 enum SourceKind: Hashable {
-    case tap
+    case system
+    case app(pid_t)
     case input
 }
 
@@ -18,6 +20,13 @@ enum SourceKind: Hashable {
 struct RouteKey: Hashable {
     var source: SourceKind
     var bus: Int
+}
+
+/// Per-app (or per-lane) desired mix parameters, kept across engine restarts.
+struct AppLaneParams: Hashable {
+    var gainDB: Float = 0
+    var pan: Float = 0
+    var muted = false
 }
 
 /// Real input-device selection for the optional microphone / interface lane.
@@ -54,6 +63,15 @@ struct ProcRow: Identifiable, Hashable {
     var name: String
     var bundleID: String?
     var isRunningOutput: Bool
+    /// True for regular user-facing apps (used to sort them above daemons).
+    var isUserApp: Bool = false
+
+    /// Human-friendly name: when the catalog only knows a bundle ID
+    /// ("com.apple.mediaremoted"), show its last component instead.
+    var displayName: String {
+        if name.contains(" ") || !name.contains(".") { return name }
+        return name.split(separator: ".").last.map(String.init) ?? name
+    }
 }
 
 // MARK: - Formatting
@@ -73,6 +91,17 @@ enum Fmt {
         let s = max(0, Int(seconds))
         return String(format: "%02d:%02d", s / 60, s % 60)
     }
+}
+
+/// A decaying max-hold for a stereo meter — the "peak line" that rides the
+/// maximum level then slowly falls. Advanced at the meter poll cadence by
+/// AppModel (so it keeps decaying during silence, which value-change
+/// observation alone could not drive). Values are dBFS with a -∞ floor.
+struct PeakHold: Equatable {
+    var l: Float = -.infinity
+    var r: Float = -.infinity
+    var lTicks: Int = 0
+    var rTicks: Int = 0
 }
 
 // MARK: - Meter geometry / zones

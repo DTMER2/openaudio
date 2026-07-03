@@ -59,19 +59,30 @@ func runEngine(_ o: RunOptions) throws {
             OALog.info("Tapping PID \(pid) -> process object \(obj)")
             objs.append(obj)
         }
-        tapMode = .processes(objs)
+        // CLI taps exactly the PIDs given: one single-object lane per PID.
+        tapMode = .processes(objs.map { [$0] })
+    }
+
+    // Each tapped PID is its own lane now; the CLI's single --gain / --pan /
+    // "tap" commands apply to every tap lane uniformly.
+    let laneCount: Int
+    switch tapMode {
+    case .system:               laneCount = 1
+    case .processes(let lanes): laneCount = max(1, lanes.count)
     }
 
     var cfg = EngineConfig(tapMode: tapMode)
     cfg.inputDeviceUID = o.inputSpec
     cfg.recordURL = o.recordPath.map { URL(fileURLWithPath: $0) }
     cfg.silenceWindow = o.silenceWindow
-    cfg.tapGainDB = o.tapGainDB
+    cfg.tapGainsDB = Array(repeating: o.tapGainDB, count: laneCount)
+    cfg.tapPans = Array(repeating: o.tapPan, count: laneCount)
     cfg.inputGainDB = o.inputGainDB
-    cfg.tapPan = o.tapPan
     cfg.busCount = o.busCount
-    cfg.routes = o.routes.map { spec in
-        EngineRoute(source: spec.source == "input" ? .input : .tap, buses: spec.buses)
+    cfg.outputMode = o.singleDevice ? .single16ch : .separateDevices
+    cfg.routes = o.routes.flatMap { spec -> [EngineRoute] in
+        if spec.source == "input" { return [EngineRoute(source: .input, buses: spec.buses)] }
+        return (0..<laneCount).map { EngineRoute(source: .tap($0), buses: spec.buses) }
     }
 
     let engine = try Engine(config: cfg)
@@ -166,12 +177,15 @@ func startInteractive(_ engine: Engine, statsTimer: DispatchSourceTimer) {
     t.start()
 }
 
-func parseSource(_ s: String) throws -> EngineSource {
-    switch s.lowercased() {
-    case "tap":   return .tap
-    case "input": return .input
-    default: throw OAError("source must be 'tap' or 'input': \(s)")
+/// "tap" -> every tap lane, "tapN" -> lane N (1-based), "input" -> input.
+func parseSources(_ s: String, engine: Engine) throws -> [EngineSource] {
+    let lower = s.lowercased()
+    if lower == "tap" { return (0..<engine.tapLaneCount).map { .tap($0) } }
+    if lower == "input" { return [.input] }
+    if lower.hasPrefix("tap"), let n = Int(lower.dropFirst(3)), n >= 1, n <= engine.tapLaneCount {
+        return [.tap(n - 1)]
     }
+    throw OAError("source must be 'tap', 'tapN' (1...\(engine.tapLaneCount)) or 'input': \(s)")
 }
 
 func parseOnOff(_ s: String) throws -> Bool {
@@ -187,26 +201,23 @@ func handleCommand(_ engine: Engine, _ cmd: String, _ args: [String],
     switch cmd {
     case "route":
         guard args.count == 3 else { throw OAError("usage: route <src> <bus> on|off") }
-        let src = try parseSource(args[0])
+        let srcs = try parseSources(args[0], engine: engine)
         guard let bus1 = Int(args[1]), bus1 >= 1 else { throw OAError("bus must be a 1-based integer") }
         let on = try parseOnOff(args[2])
-        try engine.setRoute(src, bus: bus1 - 1, on: on)
+        for src in srcs { try engine.setRoute(src, bus: bus1 - 1, on: on) }
         OALog.info("route \(args[0]) \(bus1) \(on ? "on" : "off") -> \(engine.routingDescription())")
     case "gain":
         guard args.count == 2, let db = Float(args[1]) else { throw OAError("usage: gain <src> <dB>") }
-        let src = try parseSource(args[0])
-        engine.setGain(src, dB: db)
+        for src in try parseSources(args[0], engine: engine) { engine.setGain(src, dB: db) }
         OALog.info("gain \(args[0]) = \(db) dB")
     case "pan":
         guard args.count == 2, let v = Float(args[1]) else { throw OAError("usage: pan <src> <-1..1>") }
-        let src = try parseSource(args[0])
-        engine.setPan(src, max(-1, min(1, v)))
+        for src in try parseSources(args[0], engine: engine) { engine.setPan(src, max(-1, min(1, v))) }
         OALog.info("pan \(args[0]) = \(max(-1, min(1, v)))")
     case "mute":
         guard args.count == 2 else { throw OAError("usage: mute <src> on|off") }
-        let src = try parseSource(args[0])
         let on = try parseOnOff(args[1])
-        engine.setMute(src, on)
+        for src in try parseSources(args[0], engine: engine) { engine.setMute(src, on) }
         OALog.info("mute \(args[0]) \(on ? "on" : "off")")
     case "attach":
         guard args.count == 1, let bus1 = Int(args[0]), bus1 >= 1 else { throw OAError("usage: attach <bus>") }
@@ -296,14 +307,17 @@ func runProcesses() throws {
 
 /// Opens the virtual device's INPUT (channels 0/1) with its own IOProc and
 /// records to CAF. Independent, second-process proof of the end-to-end path.
-func runProbe(output: String, duration: Double?, deviceUID: String = "OpenAudioDevice-1") throws {
+func runProbe(output: String, duration: Double?, deviceUID: String = "OpenAudioDevice-1",
+              pair: Int = 1) throws {
     let uid = deviceUID
     let dev = DeviceUtil.device(forUID: uid)
     guard dev != 0 else { throw OAError("Virtual device '\(uid)' not found.") }
     let rate = DeviceUtil.nominalSampleRate(dev)
     let sr = rate > 0 ? rate : 48000
     let dur = duration ?? 15.0
-    OALog.info(String(format: "probe-vdev: recording virtual device input ch0/1 for %.1f s @ %.0f Hz -> %@", dur, sr, output))
+    let chOff = (pair - 1) * 2
+    OALog.info(String(format: "probe-vdev: recording virtual device input ch%d/%d for %.1f s @ %.0f Hz -> %@",
+                      chOff + 1, chOff + 2, dur, sr, output))
 
     // Preallocated capture buffer (stereo), filled by the RT IOProc via memcpy.
     let capacityFrames = Int(sr * (dur + 1.0))
@@ -319,12 +333,13 @@ func runProbe(output: String, duration: Double?, deviceUID: String = "OpenAudioD
         let ch = Int(inList[0].mNumberChannels)
         if ch <= 0 { return }
         let frames = Int(inList[0].mDataByteSize) / (ch * MemoryLayout<Float>.size)
+        if ch < chOff + 2 { return }
         let src = raw.assumingMemoryBound(to: Float.self)
         var pos = offset.pointee
         var i = 0
         while i < frames && pos < capacityFrames {
-            buffer[pos * 2] = src[i * ch]
-            buffer[pos * 2 + 1] = ch > 1 ? src[i * ch + 1] : src[i * ch]
+            buffer[pos * 2] = src[i * ch + chOff]
+            buffer[pos * 2 + 1] = src[i * ch + chOff + 1]
             pos += 1; i += 1
         }
         offset.pointee = pos
@@ -379,8 +394,8 @@ do {
         runDevices(); exit(0)
     case .processes:
         try runProcesses(); exit(0)
-    case .probeVDev(let out, let dur, let uid):
-        try runProbe(output: out, duration: dur, deviceUID: uid); exit(0)
+    case .probeVDev(let out, let dur, let uid, let pair):
+        try runProbe(output: out, duration: dur, deviceUID: uid, pair: pair); exit(0)
     case .buses(let count):
         try runBuses(count: count); exit(0)
     case .run(let o):

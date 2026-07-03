@@ -18,6 +18,14 @@ struct OpenAudioApp: App {
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {}   // no "New" — this is a utility
+            CommandGroup(after: .sidebar) {
+                // The Logic-style bare X shortcut is handled by a key monitor
+                // in MainWindowView (a bare-key menu equivalent would steal
+                // "x" from text fields); this menu item is for discoverability.
+                Button(model.mixerVisible ? "Hide Mixer" : "Show Mixer") {
+                    model.mixerVisible.toggle()
+                }
+            }
         }
 
         MenuBarExtra {

@@ -21,6 +21,7 @@ struct RunOptions {
     var statsInterval: Double = 2.0
     var silenceWindow: Double = 10.0
     var busCount: Int = 1
+    var singleDevice = false      // pack all buses into OpenAudioDevice-1 ch pairs
     var routes: [RouteSpec] = []  // empty => all sources -> bus 1
     var monitorBus: Int?          // 0-based; nil => monitoring off
     var monitorGainDB: Float = 0
@@ -28,7 +29,7 @@ struct RunOptions {
 
 enum ParsedCommand {
     case run(RunOptions)
-    case probeVDev(output: String, duration: Double?, deviceUID: String)
+    case probeVDev(output: String, duration: Double?, deviceUID: String, pair: Int)
     case buses(count: Int?)       // nil => read/list; non-nil => set then list
     case devices
     case processes
@@ -46,7 +47,7 @@ enum CLI {
                     [--record <out.caf>] [--duration <sec>] [--stats-interval <sec>]
                     [--silence-window <sec>]
       openaudio buses [N]
-      openaudio probe-vdev -o <out.caf> [--duration <sec>] [--device <uid>]
+      openaudio probe-vdev -o <out.caf> [--duration <sec>] [--device <uid>] [--pair N]
       openaudio devices
       openaudio processes
       openaudio --help
@@ -66,6 +67,9 @@ enum CLI {
       --tap-system          Tap all system output.
       --input default|<uid> Add a real input device as a source (drift-compensated in-aggregate).
       --buses N             Attach buses 1..N (virtual devices OpenAudioDevice-1..N). Default 1.
+      --single-device       16ch pair-packed mode: all buses land on OpenAudioDevice-1,
+                            bus n on channels (2n-1)/(2n) — record every bus in a DAW
+                            through ONE input device (BlackHole-16ch style).
       --route <src>=<b,..>  Route source (tap|input) to 1-based bus indices. Repeatable.
                             Default (no --route): all sources -> bus 1.
       --gain tap=<dB>       Tap gain in dB (default 0).
@@ -142,6 +146,8 @@ enum CLI {
                     throw CLIError("--buses requires an integer 1..8")
                 }
                 o.busCount = n
+            case "--single-device":
+                o.singleDevice = true
             case "--route":
                 i += 1
                 guard i < args.count else { throw CLIError("--route requires <src>=<bus[,bus...]>") }
@@ -217,6 +223,7 @@ enum CLI {
         var output: String?
         var duration: Double?
         var deviceUID = "OpenAudioDevice-1"
+        var pair = 1
         var i = 0
         while i < args.count {
             let a = args[i]
@@ -233,13 +240,19 @@ enum CLI {
                 i += 1
                 guard i < args.count else { throw CLIError("--device requires a device UID") }
                 deviceUID = args[i]
+            case "--pair":
+                i += 1
+                guard i < args.count, let n = Int(args[i]), n >= 1, n <= 8 else {
+                    throw CLIError("--pair requires a 1-based channel-pair index 1..8")
+                }
+                pair = n
             default:
                 throw CLIError("Unknown probe-vdev argument: \(a)")
             }
             i += 1
         }
         guard let out = output else { throw CLIError("probe-vdev requires -o <out.caf>") }
-        return .probeVDev(output: out, duration: duration, deviceUID: deviceUID)
+        return .probeVDev(output: out, duration: duration, deviceUID: deviceUID, pair: pair)
     }
 
     private static func splitKV(_ s: String, flag: String) throws -> (String, String) {

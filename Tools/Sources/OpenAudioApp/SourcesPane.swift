@@ -1,9 +1,11 @@
 // SourcesPane.swift
 // Pane 1 (F-U3 / F-U5): choose capture sources (system audio or specific running
-// processes, plus an optional real input device), and adjust per-source
-// gain / pan / mute with live L/R meters.
+// applications, plus an optional real input device). Rows show the app icon and
+// a friendly name; user-facing apps sort above daemons. Per-source levels live
+// in the mixer drawer (X key), not here.
 
 import SwiftUI
+import AppKit
 
 struct SourcesPane: View {
     @Bindable var model: AppModel
@@ -18,8 +20,6 @@ struct SourcesPane: View {
                     systemToggle
                     processList
                     inputPicker
-                    Divider()
-                    strips
                 }
                 .padding(14)
             }
@@ -75,34 +75,60 @@ struct SourcesPane: View {
                 .opacity(model.useSystemAudio ? 0.45 : 1)
                 .disabled(model.useSystemAudio || sourcesLocked)
             }
+            if selectionAtCap {
+                Text("Up to \(model.maxSelectableApps) apps can be captured at once.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
         }
     }
 
+    private var selectionAtCap: Bool { model.selectedPIDs.count >= model.maxSelectableApps }
+
     private func processRow(_ row: ProcRow) -> some View {
-        Button {
+        let selected = model.isSelected(pid: row.pid)
+        let selectable = selected || !selectionAtCap
+        return Button {
             model.toggleProcess(pid: row.pid)
         } label: {
             HStack(spacing: 8) {
-                Image(systemName: model.isSelected(pid: row.pid) ? "checkmark.square.fill" : "square")
-                    .foregroundStyle(model.isSelected(pid: row.pid) ? Color.accentColor : .secondary)
+                Image(systemName: selected ? "checkmark.square.fill" : "square")
+                    .foregroundStyle(selected ? Color.accentColor : .secondary)
+                appIcon(row)
                 Circle()
                     .fill(row.isRunningOutput ? Color.green : Color.secondary.opacity(0.35))
                     .frame(width: 7, height: 7)
                     .help(row.isRunningOutput ? "Currently playing" : "Idle")
-                Text(row.name).lineLimit(1)
+                Text(row.displayName).lineLimit(1)
+                    .help(row.bundleID ?? row.name)
                 Spacer()
-                Text("pid \(row.pid)").font(.caption2).foregroundStyle(.secondary)
+                Text("pid \(row.pid)").font(.caption2).foregroundStyle(.tertiary)
             }
             .contentShape(Rectangle())
             .padding(.vertical, 3)
         }
         .buttonStyle(.plain)
+        .disabled(!selectable)
+        .opacity(selectable ? 1 : 0.4)
+    }
+
+    @ViewBuilder private func appIcon(_ row: ProcRow) -> some View {
+        if let icon = model.appIcons[row.pid] {
+            Image(nsImage: icon)
+                .resizable()
+                .frame(width: 18, height: 18)
+        } else {
+            Image(systemName: "app.dashed")
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+                .frame(width: 18, height: 18)
+        }
     }
 
     private var filteredProcesses: [ProcRow] {
         let base = model.processes
         guard !search.isEmpty else { return base }
-        return base.filter { $0.name.localizedCaseInsensitiveContains(search)
+        return base.filter { $0.displayName.localizedCaseInsensitiveContains(search)
+            || $0.name.localizedCaseInsensitiveContains(search)
             || ($0.bundleID?.localizedCaseInsensitiveContains(search) ?? false) }
     }
 
@@ -126,95 +152,5 @@ struct SourcesPane: View {
         }
     }
 
-    // MARK: Source strips (F-U5)
-
-    @ViewBuilder private var strips: some View {
-        Text("Levels").font(.headline)
-        HStack(alignment: .top, spacing: 18) {
-            if model.tapActive {
-                SourceStrip(model: model, kind: .tap, title: tapTitle, icon: "waveform")
-            }
-            if model.inputActive {
-                SourceStrip(model: model, kind: .input, title: model.inputSelection.label, icon: "mic.fill")
-            }
-            if !model.tapActive && !model.inputActive {
-                Text("Choose a source above to see its level and controls.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private var tapTitle: String {
-        if model.useSystemAudio { return "System" }
-        let n = model.selectedPIDs.count
-        return n == 1 ? "1 app" : "\(n) apps"
-    }
-
     private var sourcesLocked: Bool { model.isRecording }
-}
-
-/// One mixer strip: title, meter, gain, pan, mute.
-struct SourceStrip: View {
-    @Bindable var model: AppModel
-    let kind: SourceKind
-    let title: String
-    let icon: String
-
-    var body: some View {
-        VStack(spacing: 8) {
-            Label(title, systemImage: icon)
-                .font(.caption).lineLimit(1)
-                .frame(maxWidth: 120)
-
-            StereoMeterView(meter: model.sourceMeter(kind), height: 130)
-                .frame(width: 46)
-
-            // Gain -40…+12 dB
-            VStack(spacing: 2) {
-                Slider(value: gainBinding, in: -40...12)
-                    .controlSize(.small)
-                Text(Fmt.dB(gainValue)).font(.caption2).foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
-            .frame(width: 110)
-
-            // Pan -1…+1
-            VStack(spacing: 2) {
-                Slider(value: panBinding, in: -1...1) {
-                    Text("Pan")
-                } minimumValueLabel: { Text("L").font(.caption2) }
-                  maximumValueLabel: { Text("R").font(.caption2) }
-                    .controlSize(.small)
-                Text(panLabel).font(.caption2).foregroundStyle(.secondary)
-            }
-            .frame(width: 110)
-
-            Button {
-                model.setMute(kind, !muted)
-            } label: {
-                Label("Mute", systemImage: muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                    .font(.caption)
-            }
-            .buttonStyle(.bordered)
-            .tint(muted ? .red : .accentColor)
-        }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.04)))
-    }
-
-    private var muted: Bool { kind == .tap ? model.tapMuted : model.inputMuted }
-    private var gainValue: Float { kind == .tap ? model.tapGainDB : model.inputGainDB }
-    private var panValue: Float { kind == .tap ? model.tapPan : model.inputPan }
-
-    private var gainBinding: Binding<Double> {
-        Binding(get: { Double(gainValue) }, set: { model.setGain(kind, Float($0)) })
-    }
-    private var panBinding: Binding<Double> {
-        Binding(get: { Double(panValue) }, set: { model.setPan(kind, Float($0)) })
-    }
-    private var panLabel: String {
-        let p = panValue
-        if abs(p) < 0.02 { return "Center" }
-        return p < 0 ? String(format: "L %.0f%%", -p * 100) : String(format: "R %.0f%%", p * 100)
-    }
 }

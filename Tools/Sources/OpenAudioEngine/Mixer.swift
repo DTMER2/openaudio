@@ -46,31 +46,44 @@ public func unpackMonitor(_ w: UInt64) -> (Int32, Float) {
 }
 
 /// Publishes effective per-source (L, R) gains as atomic packed words.
+/// Sources are N tap lanes (one per tapped app, or one for the system tap)
+/// followed by the optional input device; the input word always lives at index
+/// `tapCount` so the RT context can index lanes without conditionals.
 public final class MixParamsStore: @unchecked Sendable {
-    private let tapWord: Atomic64
-    private let inputWord: Atomic64
+    public let tapCount: Int
 
     // Off-RT authoritative source parameters.
-    public var tap = SourceParams()
+    public var taps: [SourceParams]
     public var input = SourceParams()
 
-    public init() {
-        tapWord = Atomic64(packGainPair(1, 1))
-        inputWord = Atomic64(packGainPair(1, 1))
+    // Contiguous packed (L,R) gain words: 0..<tapCount taps, tapCount = input.
+    // Each is an aligned 64-bit word, so a plain load/store is never torn on
+    // arm64/x86_64 (same discipline as Atomic64).
+    private let words: UnsafeMutablePointer<UInt64>
+
+    public init(tapCount: Int) {
+        self.tapCount = max(0, tapCount)
+        self.taps = Array(repeating: SourceParams(), count: self.tapCount)
+        self.words = UnsafeMutablePointer<UInt64>.allocate(capacity: self.tapCount + 1)
+        self.words.initialize(repeating: packGainPair(1, 1), count: self.tapCount + 1)
         publish()
     }
 
-    /// Raw pointers handed to the RT capture context (read-only there).
-    public var tapWordPointer: UnsafeMutablePointer<UInt64> { tapWord.raw }
-    public var inputWordPointer: UnsafeMutablePointer<UInt64> { inputWord.raw }
+    deinit { words.deallocate() }
+
+    /// Raw pointer handed to the RT capture context (read-only there).
+    public var wordsPointer: UnsafeMutablePointer<UInt64> { words }
 
     /// Recomputes effective gains and atomically publishes them. Off-RT only;
     /// callers serialize (Engine uses its control queue).
     public func publish() {
-        let (tl, tr) = Self.lr(tap)
+        for i in 0..<tapCount {
+            let (l, r) = Self.lr(taps[i])
+            words[i] = packGainPair(l, r)
+        }
         let (il, ir) = Self.lr(input)
-        tapWord.store(packGainPair(tl, tr))
-        inputWord.store(packGainPair(il, ir))
+        words[tapCount] = packGainPair(il, ir)
+        OSMemoryBarrier()
     }
 
     /// Equal-power pan + gain + mute -> (leftGain, rightGain).

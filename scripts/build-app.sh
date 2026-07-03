@@ -27,7 +27,31 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/$PRODUCT"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+# App icon: compile the Icon Composer source (Tools/App/icon.icon) with actool.
+# Produces icon.icns (Dock/Finder) + Assets.car (macOS 26 tinting). Skipped
+# gracefully if actool or the source is unavailable.
+ICON_SRC="$REPO/Tools/App/icon.icon"
+HAS_ICON=0
+if command -v actool >/dev/null 2>&1 && [[ -d "$ICON_SRC" ]]; then
+    echo "==> Compiling app icon..."
+    actool "$ICON_SRC" \
+        --compile "$APP/Contents/Resources" \
+        --app-icon icon \
+        --output-partial-info-plist "$BUILD/icon-partial.plist" \
+        --platform macosx --minimum-deployment-target 14.4 \
+        --target-device mac \
+        --output-format human-readable-text >/dev/null 2>&1 \
+        && HAS_ICON=1 || echo "    (icon compilation failed; continuing without one)"
+fi
+ICON_KEYS=""
+if [[ "$HAS_ICON" == "1" ]]; then
+    ICON_KEYS='    <key>CFBundleIconFile</key>
+    <string>icon</string>
+    <key>CFBundleIconName</key>
+    <string>icon</string>'
+fi
+
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -37,9 +61,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleDisplayName</key>
     <string>OpenAudio</string>
     <key>CFBundleIdentifier</key>
-    <string>com.openaudio.app</string>
+    <string>jp.coremedica.openaudio</string>
     <key>CFBundleExecutable</key>
     <string>OpenAudioApp</string>
+$ICON_KEYS
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>

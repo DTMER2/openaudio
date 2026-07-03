@@ -41,8 +41,12 @@ public struct BusRTContext {
     public var busIndex: Int
 }
 
-/// Routing matrix bit index for (source, bus). sources <= 2, buses <= 8, so the
-/// whole matrix fits in the low 16 bits of a UInt64 (single atomic snapshot).
+/// Maximum number of mix sources (tap lanes + optional input). Bounded by the
+/// 64-bit routing word: kOpenAudioMaxSources * kOpenAudioMaxBuses <= 64.
+public let kOpenAudioMaxSources = 8
+
+/// Routing matrix bit index for (source, bus). sources <= 8, buses <= 8, so the
+/// whole matrix fits in a UInt64 (single atomic snapshot).
 @inline(__always)
 public func routeBit(source: Int, bus: Int) -> UInt64 {
     UInt64(1) << UInt64(source * kOpenAudioMaxBuses + bus)
@@ -65,6 +69,18 @@ public func retireBusSlot(_ slots: UnsafeMutablePointer<UnsafeMutableRawPointer?
                           _ index: Int) {
     slots[index] = nil
     OSMemoryBarrier()
+}
+
+/// Where a bus's stereo mix lands (F-E6).
+public enum BusOutputMode: String, Sendable {
+    /// Bus n -> its own virtual device "OpenAudioDevice-n", channels 1/2.
+    case separateDevices
+    /// Every bus -> ONE virtual device "OpenAudioDevice-1", bus n on channel
+    /// pair (2n-1)/(2n) — BlackHole-16ch-style, so a DAW can record all buses
+    /// through a single input device. Each bus keeps its own consumer IOProc
+    /// on that device (each writes only its pair, zeros elsewhere; the HAL
+    /// sums the IOProc outputs).
+    case single16ch
 }
 
 /// Off-RT owner of one bus: bridge + consumer IOProc on a virtual device.
@@ -91,18 +107,29 @@ public final class Bus: @unchecked Sendable {
         self.rtCtx = rtCtx
     }
 
-    /// Build and start a bus for `index` (0-based). Resolves virtual device
-    /// "OpenAudioDevice-(index+1)". Throws a clear error if the device is
+    /// Build and start a bus for `index` (0-based). In `.separateDevices` mode
+    /// resolves virtual device "OpenAudioDevice-(index+1)" (channels 1/2); in
+    /// `.single16ch` mode resolves "OpenAudioDevice-1" and writes the bus onto
+    /// channel pair 2*index / 2*index+1. Throws a clear error if the device is
     /// absent (e.g. the driver has not published that many devices yet).
-    public static func attach(index: Int, captureRate: Double) throws -> Bus {
+    public static func attach(index: Int, captureRate: Double,
+                              output: BusOutputMode = .separateDevices) throws -> Bus {
         precondition(index >= 0 && index < kOpenAudioMaxBuses)
-        let uid = "OpenAudioDevice-\(index + 1)"
+        let uid = output == .single16ch ? "OpenAudioDevice-1" : "OpenAudioDevice-\(index + 1)"
+        let channelOffset = output == .single16ch ? index * 2 : 0
         let vdev = DeviceUtil.device(forUID: uid)
         guard vdev != 0 else {
             throw OAError("Virtual device '\(uid)' (bus \(index + 1)) not found. " +
                           "The OpenAudio driver may not publish that many devices — " +
                           "set the device count with `openaudio buses \(index + 1)` " +
                           "(requires the Phase 2 driver), or attach fewer buses.")
+        }
+        if output == .single16ch {
+            let outCh = DeviceUtil.channelCount(vdev, scope: kAudioObjectPropertyScopeOutput)
+            guard outCh >= channelOffset + 2 else {
+                throw OAError("Device '\(uid)' has \(outCh) output channels; bus \(index + 1) " +
+                              "needs channels \(channelOffset + 1)/\(channelOffset + 2).")
+            }
         }
         let dr = DeviceUtil.nominalSampleRate(vdev)
         let deviceRate = dr > 0 ? dr : 48000
@@ -119,7 +146,9 @@ public final class Bus: @unchecked Sendable {
             deviceSampleRate: deviceRate,
             kpPPM: 300.0, kiPPM: 40.0, maxPPM: 500.0)
 
-        // Consumer IOProc (driver clock) — same block as Phase 1.
+        // Consumer IOProc (driver clock) — same block as Phase 1, with the
+        // bus's channel pair placed at `channelOffset` (0 in separate-device
+        // mode; 2*index in single-16ch mode).
         let ctx = bridge.consumerCtxPointer
         let block: AudioDeviceIOBlock = { (_, _, _, outOutputData, _) in
             let outList = UnsafeMutableAudioBufferListPointer(outOutputData)
@@ -127,7 +156,8 @@ public final class Bus: @unchecked Sendable {
             let ch = Int(outList[0].mNumberChannels)
             if ch <= 0 { return }
             let frames = Int(outList[0].mDataByteSize) / (ch * MemoryLayout<Float>.size)
-            bridgeConsume(ctx, out: raw.assumingMemoryBound(to: Float.self), frames: frames, channels: ch)
+            bridgeConsume(ctx, out: raw.assumingMemoryBound(to: Float.self), frames: frames,
+                          channels: ch, channelOffset: channelOffset)
         }
         var procID: AudioDeviceIOProcID?
         try check(AudioDeviceCreateIOProcIDWithBlock(&procID, vdev, nil, block),
@@ -154,8 +184,8 @@ public final class Bus: @unchecked Sendable {
             rtCtx.deinitialize(count: 1); rtCtx.deallocate()
             throw error
         }
-        OALog.info(String(format: "Bus %d attached: device '%@' id=%d @ %.0f Hz, baseRatio=%.6f",
-                          index + 1, uid, vdev, deviceRate, baseRatio))
+        OALog.info(String(format: "Bus %d attached: device '%@' id=%d ch %d/%d @ %.0f Hz, baseRatio=%.6f",
+                          index + 1, uid, vdev, channelOffset + 1, channelOffset + 2, deviceRate, baseRatio))
         return bus
     }
 

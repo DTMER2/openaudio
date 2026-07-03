@@ -21,6 +21,8 @@ struct BottomBar: View {
                 Divider().frame(height: 34)
                 statusBlock
                 Spacer()
+                revealRecordingsButton
+                mixerToggle
                 masterMeter
             }
             .padding(.horizontal, 16).padding(.vertical, 10)
@@ -93,14 +95,37 @@ struct BottomBar: View {
         return model.isRunning ? "Running" : "Stopped"
     }
 
+    // MARK: Reveal recordings folder
+
+    private var revealRecordingsButton: some View {
+        Button {
+            model.revealRecordings()
+        } label: {
+            Image(systemName: "folder").foregroundStyle(.secondary)
+        }
+        .buttonStyle(.bordered)
+        .help("Show recordings in Finder")
+    }
+
+    // MARK: Mixer toggle
+
+    private var mixerToggle: some View {
+        Button {
+            model.mixerVisible.toggle()
+        } label: {
+            Image(systemName: "slider.vertical.3")
+                .foregroundStyle(model.mixerVisible ? Color.accentColor : .secondary)
+        }
+        .buttonStyle(.bordered)
+        .help(model.mixerVisible ? "Hide the mixer (X)" : "Show the mixer (X)")
+    }
+
     // MARK: Master meter
 
     private var masterMeter: some View {
-        VStack(alignment: .trailing, spacing: 3) {
-            Text("Output").font(.caption2).foregroundStyle(.secondary)
-            MiniMeterView(peakDB: model.mixMeter?.peakL ?? -.infinity, width: 120, height: 7)
-            MiniMeterView(peakDB: model.mixMeter?.peakR ?? -.infinity, width: 120, height: 7)
-        }
+        StereoMiniMeterView(peakL: model.mixMeter?.peakL ?? -.infinity,
+                            peakR: model.mixMeter?.peakR ?? -.infinity,
+                            hold: model.mixHold, width: 120)
     }
 
     // MARK: Error / TCC guidance

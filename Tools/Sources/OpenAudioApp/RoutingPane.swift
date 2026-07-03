@@ -6,6 +6,8 @@
 // a headphones monitor toggle (F-M1) and a mini level meter.
 
 import SwiftUI
+import AppKit
+import OpenAudioEngine
 
 struct RoutingPane: View {
     @Bindable var model: AppModel
@@ -31,12 +33,8 @@ struct RoutingPane: View {
         }
     }
 
-    private var sources: [SourceKind] {
-        var s: [SourceKind] = []
-        if model.tapActive { s.append(.tap) }
-        if model.inputActive { s.append(.input) }
-        return s
-    }
+    /// One node per source: the system tap OR each selected app, plus input.
+    private var sources: [SourceKind] { model.mixSources }
 
     // MARK: Header controls (bus add/remove + monitor level)
 
@@ -44,15 +42,31 @@ struct RoutingPane: View {
         HStack(spacing: 12) {
             HStack(spacing: 4) {
                 Text("Buses").font(.subheadline).foregroundStyle(.secondary)
-                Button { attemptRemove() } label: { Image(systemName: "minus") }
+                Button { attemptRemove() } label: {
+                    Image(systemName: "minus").frame(width: 12, height: 12)
+                }
                     .buttonStyle(.bordered).controlSize(.small)
                     .disabled(model.busCount <= 1 || model.busOpInProgress)
                 Text("\(model.busCount)").font(.subheadline).monospacedDigit().frame(minWidth: 16)
-                Button { model.addBus() } label: { Image(systemName: "plus") }
+                Button { model.addBus() } label: {
+                    Image(systemName: "plus").frame(width: 12, height: 12)
+                }
                     .buttonStyle(.bordered).controlSize(.small)
                     .disabled(model.busCount >= model.maxBuses || model.busOpInProgress)
                 if model.busOpInProgress { ProgressView().controlSize(.small).scaleEffect(0.6) }
             }
+            Picker("", selection: Binding(get: { model.outputMode },
+                                          set: { model.setOutputMode($0) })) {
+                Text("Devices").tag(BusOutputMode.separateDevices)
+                Text("16ch (DAW)").tag(BusOutputMode.single16ch)
+            }
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+            .frame(width: 190)
+            .disabled(model.isRecording || model.busOpInProgress)
+            .help("Devices: each bus is its own stereo output device. " +
+                  "16ch (DAW): every bus lands on a channel pair of the single " +
+                  "\"OpenAudio 16ch\" device, so a DAW records all buses through one input device.")
             Spacer()
             if model.monitorBusIndex != nil {
                 HStack(spacing: 6) {
@@ -82,23 +96,33 @@ struct RoutingPane: View {
         let busPts = columnPoints(count: model.busCount, x: rightX, height: size.height)
 
         return ZStack {
-            // Edges.
+            // Edges (visual).
             Canvas { ctx, _ in
                 for (si, src) in sources.enumerated() {
                     for bi in 0..<model.busCount {
                         guard si < srcPts.count, bi < busPts.count else { continue }
                         let a = CGPoint(x: srcPts[si].x + nodeW / 2, y: srcPts[si].y)
                         let b = CGPoint(x: busPts[bi].x - nodeW / 2, y: busPts[bi].y)
-                        var path = Path()
-                        path.move(to: a)
-                        path.addCurve(to: b,
-                                      control1: CGPoint(x: (a.x + b.x) / 2, y: a.y),
-                                      control2: CGPoint(x: (a.x + b.x) / 2, y: b.y))
                         let active = model.isRouted(src, bus: bi)
-                        ctx.stroke(path,
+                        ctx.stroke(edgePath(a, b),
                                    with: .color(active ? Color.accentColor : Color.secondary.opacity(0.18)),
                                    style: StrokeStyle(lineWidth: active ? 2.5 : 1.2,
                                                       dash: active ? [] : [4, 4]))
+                    }
+                }
+            }
+
+            // Edge hit areas: the whole line is clickable, so overlapping toggles at
+            // the graph centre never block a connection — click any clear stretch.
+            ForEach(Array(sources.enumerated()), id: \.offset) { si, src in
+                ForEach(0..<model.busCount, id: \.self) { bi in
+                    if si < srcPts.count && bi < busPts.count {
+                        let a = CGPoint(x: srcPts[si].x + nodeW / 2, y: srcPts[si].y)
+                        let b = CGPoint(x: busPts[bi].x - nodeW / 2, y: busPts[bi].y)
+                        let shape = EdgeShape(a: a, b: b)
+                        shape.strokedHit(width: 14)
+                            .onTapGesture { model.toggleRoute(src, bus: bi) }
+                            .help(model.isRouted(src, bus: bi) ? "Disconnect" : "Connect")
                     }
                 }
             }
@@ -131,6 +155,16 @@ struct RoutingPane: View {
         return (0..<count).map { CGPoint(x: x, y: slot * (CGFloat($0) + 0.5)) }
     }
 
+    /// The cubic used both for drawing and hit-testing an edge (control points
+    /// pulled horizontally to the midpoint x).
+    private func edgePath(_ a: CGPoint, _ b: CGPoint) -> Path {
+        let mx = (a.x + b.x) / 2
+        var p = Path()
+        p.move(to: a)
+        p.addCurve(to: b, control1: CGPoint(x: mx, y: a.y), control2: CGPoint(x: mx, y: b.y))
+        return p
+    }
+
     private func edgeToggle(_ src: SourceKind, _ bus: Int) -> some View {
         let on = model.isRouted(src, bus: bus)
         return Button { model.toggleRoute(src, bus: bus) } label: {
@@ -146,29 +180,45 @@ struct RoutingPane: View {
     private func sourceNode(_ src: SourceKind) -> some View {
         let meter = model.sourceMeter(src)
         return VStack(spacing: 4) {
-            Label(nodeTitle(src), systemImage: src == .tap ? "waveform" : "mic.fill")
-                .font(.caption).lineLimit(1)
-            MiniMeterView(peakDB: meter?.peakDB ?? -.infinity, width: 92)
+            HStack(spacing: 5) {
+                sourceIcon(src)
+                Text(model.displayName(src)).font(.caption).lineLimit(1)
+            }
+            StereoMiniMeterView(peakL: meter?.peakL ?? -.infinity,
+                                peakR: meter?.peakR ?? -.infinity,
+                                hold: model.sourceHold(src), width: 92)
         }
         .frame(width: nodeW, height: nodeH)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06)))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.10)))
     }
 
+    @ViewBuilder private func sourceIcon(_ src: SourceKind) -> some View {
+        switch src {
+        case .system:
+            Image(systemName: "speaker.wave.3.fill").font(.caption).foregroundStyle(.secondary)
+        case .app:
+            if let icon = model.icon(for: src) {
+                Image(nsImage: icon).resizable().frame(width: 16, height: 16)
+            } else {
+                Image(systemName: "app.dashed").font(.caption).foregroundStyle(.secondary)
+            }
+        case .input:
+            Image(systemName: "mic.fill").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
     private func busNode(_ bus: Int) -> some View {
         let monitoring = model.monitorBusIndex == bus
+        let stereo = model.busStereo(bus)
         return VStack(spacing: 4) {
-            HStack(spacing: 4) {
+            HStack(spacing: 5) {
+                Image(nsImage: AppIcon.image)
+                    .resizable().frame(width: 16, height: 16)
                 Text(busName(bus)).font(.caption).lineLimit(1)
-                Spacer()
-                Button { model.toggleMonitor(bus: bus) } label: {
-                    Image(systemName: monitoring ? "headphones.circle.fill" : "headphones")
-                        .foregroundStyle(monitoring ? Color.accentColor : .secondary)
-                }
-                .buttonStyle(.plain)
-                .help(monitoring ? "Monitoring on this bus" : "Monitor this bus on your output")
             }
-            MiniMeterView(peakDB: model.busPeakDB(bus), width: 92)
+            StereoMiniMeterView(peakL: stereo.l, peakR: stereo.r,
+                                hold: model.busHold(bus), width: 92)
         }
         .padding(.horizontal, 8)
         .frame(width: nodeW, height: nodeH)
@@ -178,20 +228,34 @@ struct RoutingPane: View {
             .stroke(monitoring ? Color.accentColor.opacity(0.5) : Color.primary.opacity(0.10)))
     }
 
-    private func nodeTitle(_ src: SourceKind) -> String {
-        switch src {
-        case .tap:
-            if model.useSystemAudio { return "System" }
-            let n = model.selectedPIDs.count
-            return n == 1 ? "1 app" : "\(n) apps"
-        case .input:
-            return model.inputSelection.label
+    /// Separate devices: "OpenAudio" / "OpenAudio n" (device names). Single
+    /// 16ch: the channel pair the bus occupies on the one device.
+    private func busName(_ index: Int) -> String {
+        switch model.outputMode {
+        case .single16ch:      return "Ch \(index * 2 + 1)-\(index * 2 + 2)"
+        case .separateDevices: return index == 0 ? "OpenAudio" : "OpenAudio \(index + 1)"
         }
     }
+}
 
-    /// Bus 1 == "OpenAudio 16ch"; bus n≥2 == "OpenAudio 16ch n" (mirrors the driver naming).
-    private func busName(_ index: Int) -> String {
-        index == 0 ? "OpenAudio 16ch" : "OpenAudio 16ch \(index + 1)"
+/// The routing edge curve as a `Shape`, so its stroked outline can serve as a
+/// generous, precise click target that follows the whole line.
+private struct EdgeShape: Shape {
+    let a: CGPoint
+    let b: CGPoint
+    func path(in rect: CGRect) -> Path {
+        let mx = (a.x + b.x) / 2
+        var p = Path()
+        p.move(to: a)
+        p.addCurve(to: b, control1: CGPoint(x: mx, y: a.y), control2: CGPoint(x: mx, y: b.y))
+        return p
+    }
+
+    /// A transparent, hit-testable band tracing the line at the given width.
+    func strokedHit(width: CGFloat) -> some View {
+        stroke(style: StrokeStyle(lineWidth: width, lineCap: .round))
+            .fill(Color.clear)
+            .contentShape(stroke(style: StrokeStyle(lineWidth: width, lineCap: .round)))
     }
 }
 

@@ -1,0 +1,75 @@
+name: OpenAudio
+# Generated .xcodeproj source of truth. Regenerate with:  xcodegen generate
+# The SwiftPM package (Tools/Package.swift) still builds the CLI tools
+# (openaudio / looptest / tapcapture); this project builds the GUI app + engine.
+
+options:
+  bundleIdPrefix: jp.coremedica
+  deploymentTarget:
+    macOS: "14.4"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"          # match Package.swift (swift-tools 5.10 → Swift 5 mode)
+    MACOSX_DEPLOYMENT_TARGET: "14.4"
+    ALWAYS_SEARCH_USER_PATHS: NO
+    CLANG_ENABLE_MODULES: YES
+    ENABLE_HARDENED_RUNTIME: YES  # required for Developer ID notarization later
+    # Ad-hoc signing by default (matches scripts/build-app.sh). To ship a
+    # notarized build, set DEVELOPMENT_TEAM and switch to "Developer ID Application".
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  OpenAudioEngine:
+    type: library.static
+    platform: macOS
+    sources:
+      - path: Tools/Sources/OpenAudioEngine
+    settings:
+      base:
+        PRODUCT_NAME: OpenAudioEngine
+        DEFINES_MODULE: YES
+
+  OpenAudio:
+    type: application
+    platform: macOS
+    sources:
+      - path: Tools/Sources/OpenAudioApp
+      - path: Tools/App/icon.icon
+    dependencies:
+      - target: OpenAudioEngine
+    entitlements:
+      path: Tools/App/OpenAudio.entitlements
+      properties:
+        # Hardened runtime (required for notarization) denies audio input by
+        # default; this restores mic/interface capture (NSMicrophoneUsageDescription).
+        com.apple.security.device.audio-input: true
+    info:
+      path: Tools/App/Info.plist
+      properties:
+        CFBundleName: OpenAudio
+        CFBundleDisplayName: OpenAudio
+        CFBundleIconName: icon
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSMinimumSystemVersion: "14.4"
+        LSUIElement: true
+        NSHighResolutionCapable: true
+        NSAudioCaptureUsageDescription: OpenAudio captures audio from the apps you choose so it can route, monitor, and record them.
+        NSMicrophoneUsageDescription: OpenAudio uses your microphone or audio interface as an input source when you select one.
+    settings:
+      base:
+        PRODUCT_NAME: OpenAudio
+        PRODUCT_BUNDLE_IDENTIFIER: jp.coremedica.openaudio
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: icon
+        GENERATE_INFOPLIST_FILE: NO
+        COMBINE_HIDPI_IMAGES: YES
+        SWIFT_EMIT_LOC_STRINGS: YES
+        ENABLE_PREVIEWS: YES
