@@ -118,7 +118,8 @@ private struct OutputStrip: View {
                 .foregroundStyle(monitorOn ? Color.white : Color.secondary)
             }
             .buttonStyle(.plain)
-            .help(monitorOn ? "Stop monitoring" : "Monitor the selected bus on your speakers")
+            .help(monitorOn ? "Stop monitoring"
+                  : "Monitor the selected bus on your output. Sources routed to it are then heard only through the mix (their direct playback is muted while monitoring), so nothing plays twice.")
             .onChange(of: model.monitorBusIndex) { _, new in
                 if let b = new { lastBus = b }
             }
@@ -232,7 +233,7 @@ private struct ChannelStrip: View {
                 Image(systemName: "app.dashed").font(.system(size: 14)).foregroundStyle(.secondary)
             }
         case .input:
-            Image(systemName: "mic.fill").font(.system(size: 14)).foregroundStyle(.secondary)
+            Image(systemName: model.symbol(for: kind)).font(.system(size: 14)).foregroundStyle(.secondary)
         }
     }
 
@@ -240,6 +241,21 @@ private struct ChannelStrip: View {
         let p = model.pan(kind)
         if abs(p) < 0.02 { return "C" }
         return p < 0 ? String(format: "L%.0f", -p * 100) : String(format: "R%.0f", p * 100)
+    }
+}
+
+/// The fader handle shared by the mixer strips (vertical) and the routing
+/// nodes (horizontal): a raised cap with a centre index line across the
+/// direction of travel.
+struct FaderCap: View {
+    var vertical: Bool
+    var body: some View {
+        RoundedRectangle(cornerRadius: 3)
+            .fill(Color(nsColor: .controlColor))
+            .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.primary.opacity(0.25)))
+            .overlay(Rectangle().fill(Color.primary.opacity(0.4))
+                .frame(width: vertical ? nil : 1, height: vertical ? 1 : nil))
+            .shadow(radius: 1, y: 1)
     }
 }
 
@@ -267,13 +283,9 @@ private struct FaderView: View {
                     .frame(width: width, height: 1)
                     .offset(y: y(for: 0, height: h))
                 // Cap
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(Color(nsColor: .controlColor))
-                    .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.primary.opacity(0.25)))
-                    .overlay(Rectangle().fill(Color.primary.opacity(0.4)).frame(height: 1))
+                FaderCap(vertical: true)
                     .frame(width: width, height: capHeight)
                     .offset(y: y(for: value, height: h) - capHeight / 2)
-                    .shadow(radius: 1, y: 1)
             }
             .frame(width: width)
             .contentShape(Rectangle())

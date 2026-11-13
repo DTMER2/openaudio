@@ -55,6 +55,23 @@ echo "==> OpenAudio $VERSION  (team $TEAM_ID)"
 rm -rf "$BUILD"
 mkdir -p "$BUILD"
 
+# Intermediate OpenAudio.app copies (xcodebuild output + pkg staging) get
+# registered with LaunchServices and show up as duplicate "OpenAudio.app"
+# entries (Launchpad / Open With / Spotlight), and Installer may relocate onto
+# them. Only the pkg is the deliverable: on exit (success or failure),
+# unregister and delete every intermediate bundle so the single installed
+# /Applications/OpenAudio.app is the only copy left.
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+cleanup_app_copies() {
+    local app
+    for app in "$BUILD/xcode/Release/OpenAudio.app" "$BUILD/app-root/OpenAudio.app"; do
+        [[ -d "$app" ]] || continue
+        "$LSREGISTER" -u "$app" >/dev/null 2>&1 || true
+        rm -rf "$app"
+    done
+}
+trap cleanup_app_copies EXIT
+
 # ---------------------------------------------------------------- 1. App
 echo "==> Regenerating Xcode project (xcodegen)..."
 (cd "$REPO" && xcodegen generate --quiet)
@@ -128,7 +145,9 @@ APP_ROOT="$BUILD/app-root"
 mkdir -p "$APP_ROOT"
 cp -R "$APP" "$APP_ROOT/"
 pkgbuild --analyze --root "$APP_ROOT" "$BUILD/app-components.plist" >/dev/null
-/usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$BUILD/app-components.plist"
+# Newer pkgbuild versions omit the key from --analyze output; add it then.
+/usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$BUILD/app-components.plist" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Add :0:BundleIsRelocatable bool false" "$BUILD/app-components.plist"
 
 pkgbuild --root "$APP_ROOT" \
     --component-plist "$BUILD/app-components.plist" \

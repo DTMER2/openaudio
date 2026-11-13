@@ -72,16 +72,17 @@ func runEngine(_ o: RunOptions) throws {
     }
 
     var cfg = EngineConfig(tapMode: tapMode)
-    cfg.inputDeviceUID = o.inputSpec
+    cfg.inputs = o.inputSpecs.map { EngineInput(deviceUID: $0, gainDB: o.inputGainDB) }
     cfg.recordURL = o.recordPath.map { URL(fileURLWithPath: $0) }
     cfg.silenceWindow = o.silenceWindow
     cfg.tapGainsDB = Array(repeating: o.tapGainDB, count: laneCount)
     cfg.tapPans = Array(repeating: o.tapPan, count: laneCount)
-    cfg.inputGainDB = o.inputGainDB
     cfg.busCount = o.busCount
     cfg.outputMode = o.singleDevice ? .single16ch : .separateDevices
     cfg.routes = o.routes.flatMap { spec -> [EngineRoute] in
-        if spec.source == "input" { return [EngineRoute(source: .input, buses: spec.buses)] }
+        if spec.source == "input" {
+            return o.inputSpecs.indices.map { EngineRoute(source: .input($0), buses: spec.buses) }
+        }
         return (0..<laneCount).map { EngineRoute(source: .tap($0), buses: spec.buses) }
     }
 
@@ -90,6 +91,7 @@ func runEngine(_ o: RunOptions) throws {
     activeEngine = engine
 
     // Apply requested monitoring (F-M1/M2) once buses are attached.
+    engine.setMonitorIncludesInputs(o.monitorInputs)
     if let mbus = o.monitorBus {
         engine.setMonitor(busIndex: mbus, gainDB: o.monitorGainDB)
     }
@@ -177,15 +179,19 @@ func startInteractive(_ engine: Engine, statsTimer: DispatchSourceTimer) {
     t.start()
 }
 
-/// "tap" -> every tap lane, "tapN" -> lane N (1-based), "input" -> input.
+/// "tap" -> every tap lane, "tapN" -> lane N (1-based), "input" -> every
+/// input lane, "inputN" -> input lane N (1-based).
 func parseSources(_ s: String, engine: Engine) throws -> [EngineSource] {
     let lower = s.lowercased()
     if lower == "tap" { return (0..<engine.tapLaneCount).map { .tap($0) } }
-    if lower == "input" { return [.input] }
+    if lower == "input" { return (0..<engine.inputLaneCount).map { .input($0) } }
+    if lower.hasPrefix("input"), let n = Int(lower.dropFirst(5)), n >= 1, n <= engine.inputLaneCount {
+        return [.input(n - 1)]
+    }
     if lower.hasPrefix("tap"), let n = Int(lower.dropFirst(3)), n >= 1, n <= engine.tapLaneCount {
         return [.tap(n - 1)]
     }
-    throw OAError("source must be 'tap', 'tapN' (1...\(engine.tapLaneCount)) or 'input': \(s)")
+    throw OAError("source must be 'tap', 'tapN' (1...\(engine.tapLaneCount)), 'input' or 'inputN' (1...\(engine.inputLaneCount)): \(s)")
 }
 
 func parseOnOff(_ s: String) throws -> Bool {

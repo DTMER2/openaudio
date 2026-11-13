@@ -18,7 +18,28 @@ public enum EngineSource: Hashable {
     /// One tap lane (0-based). Lane == one tapped app, or lane 0 for the
     /// system-wide tap.
     case tap(Int)
-    case input
+    /// One input-device lane (0-based, in `EngineConfig.inputs` order).
+    case input(Int)
+}
+
+/// A real input device (microphone / audio interface / Bluetooth headset mic)
+/// mixed in as its own source lane. Each input runs on its own IOProc and is
+/// resampled into the capture clock, so devices at any sample rate can be
+/// combined.
+public struct EngineInput {
+    /// "default" (the system default input) or a device UID.
+    public var deviceUID: String
+    /// Display name for stats/meters ("input n" when empty).
+    public var name: String
+    public var gainDB: Float
+    public var pan: Float
+
+    public init(deviceUID: String, name: String = "", gainDB: Float = 0, pan: Float = 0) {
+        self.deviceUID = deviceUID
+        self.name = name
+        self.gainDB = gainDB
+        self.pan = pan
+    }
 }
 
 /// Declarative route: a source enabled onto a set of 0-based bus indices.
@@ -33,7 +54,8 @@ public struct EngineRoute {
 
 public struct EngineConfig {
     public var tapMode: EngineTapMode
-    public var inputDeviceUID: String?          // "default", a UID, or nil
+    /// Input-device lanes, mixed after the tap lanes (empty == none).
+    public var inputs: [EngineInput] = []
     public var recordURL: URL?
     public var silenceWindow: Double = 10.0
 
@@ -43,8 +65,6 @@ public struct EngineConfig {
     /// Per-tap-lane initial gains/pans. Missing entries default to 0.
     public var tapGainsDB: [Float] = []
     public var tapPans: [Float] = []
-    public var inputGainDB: Float = 0
-    public var inputPan: Float = 0
 
     /// Number of buses to attach at start (1...kOpenAudioMaxBuses).
     public var busCount: Int = 1
@@ -85,11 +105,22 @@ public struct EngineStats {
 
 public final class Engine: @unchecked Sendable {
     private let config: EngineConfig
-    private let hasInput: Bool
     private let numTaps: Int
+    private let numInputs: Int
     private let numSources: Int
 
+    /// Rate the engine was configured at (monitor meters / recording header).
     private let captureRate: Double
+    /// Device that clocks the capture aggregate. OpenAudio's own virtual
+    /// device whenever the driver is present, so the mix rate never follows a
+    /// Bluetooth headset into its 16/24 kHz hands-free profile; the default
+    /// output only as a fallback.
+    private var clockUID: String
+    private var clockIsDefaultOutput: Bool
+    private let clockBufferFrames: Int
+    /// Clock-device nominal rate the CURRENT capture graph was built at; a
+    /// change triggers a capture rebuild + bridge retune.
+    private var graphRate: Double
 
     private let monitorRing: MonitorRing
     private let monitor: Monitor
@@ -105,8 +136,22 @@ public final class Engine: @unchecked Sendable {
     // Default off (bus -1). Owned here and passed by pointer to every capture
     // graph so the setting survives watchdog / device-change rebuilds.
     private let monitorWord = Atomic64(packMonitor(bus: -1, gain: 1))
+    /// One-entry slot the capture callback reads to feed the monitor output
+    /// (nil == not monitoring). The feed itself runs on the real default
+    /// output's clock and is re-attached when that device / its rate changes.
+    private let monitorSlot: UnsafeMutablePointer<UnsafeMutableRawPointer?>
+    private var monitorOut: MonitorOutput?
+    /// 1 == microphones are also heard in the monitor (default 0: excluded,
+    /// so a headset's own mic never echoes / feeds back into that headset).
+    private let monitorInputsWord = Atomic64(0)
 
     private var captureGraph: CaptureGraph?
+    /// Input devices, one per input lane, each on its own IOProc + rate bridge
+    /// (nil entry == device missing / could not be opened; lane stays silent).
+    private var inputSources: [InputSource?]
+    /// Consumer contexts handed to every capture graph (numInputs entries,
+    /// owned here so they survive capture rebuilds).
+    private let inputBridgePtrs: UnsafeMutablePointer<UnsafeMutablePointer<ConsumerCtx>?>
 
     private let controlQueue = DispatchQueue(label: "com.openaudio.engine.control")
     private var watchdogTimer: DispatchSourceTimer?
@@ -123,48 +168,85 @@ public final class Engine: @unchecked Sendable {
 
     /// Number of tap lanes (one per tapped app; 1 for the system tap).
     public var tapLaneCount: Int { numTaps }
+    /// Number of input-device lanes (== config.inputs.count).
+    public var inputLaneCount: Int { numInputs }
+    /// Per input lane: the HAL device it was opened on (0 == the device was
+    /// missing or could not be started; that lane is silent until a restart).
+    public let inputLaneDeviceIDs: [AudioObjectID]
 
     /// Routing-matrix index for a source, or nil if the source is not active.
     private func sourceIndex(_ source: EngineSource) -> Int? {
         switch source {
-        case .tap(let i):  return (i >= 0 && i < numTaps) ? i : nil
-        case .input:       return hasInput ? numTaps : nil
+        case .tap(let i):   return (i >= 0 && i < numTaps) ? i : nil
+        case .input(let j): return (j >= 0 && j < numInputs) ? numTaps + j : nil
         }
     }
 
     public init(config: EngineConfig) throws {
         self.config = config
-        self.hasInput = config.inputDeviceUID != nil
         switch config.tapMode {
         case .system:               self.numTaps = 1
         case .processes(let lanes): self.numTaps = max(1, lanes.count)
         }
-        self.numSources = numTaps + (hasInput ? 1 : 0)
+        self.numInputs = config.inputs.count
+        self.numSources = numTaps + numInputs
 
         guard numSources <= kOpenAudioMaxSources else {
-            throw OAError("Too many sources: \(numSources) (max \(kOpenAudioMaxSources) — up to \(kOpenAudioMaxSources - 1) apps plus an input)")
+            throw OAError("Too many sources: \(numSources) (max \(kOpenAudioMaxSources) apps and inputs combined)")
         }
         guard config.busCount >= 1 && config.busCount <= kOpenAudioMaxBuses else {
             throw OAError("busCount must be 1...\(kOpenAudioMaxBuses), got \(config.busCount)")
         }
 
-        // Capture runs at the default output device's rate (aggregate main).
-        let outDev = DeviceUtil.defaultOutputDevice()
-        let cr = outDev != 0 ? DeviceUtil.nominalSampleRate(outDev) : 0
+        // Capture clock: resolved first so every bridge is sized against it.
+        let clock = Self.resolveClock()
+        self.clockUID = clock.uid
+        self.clockIsDefaultOutput = clock.isDefaultOutput
+        let cr = clock.id != 0 ? DeviceUtil.nominalSampleRate(clock.id) : 0
         self.captureRate = cr > 0 ? cr : 48000
+        self.graphRate = self.captureRate
+        self.clockBufferFrames = clock.id != 0 ? max(64, DeviceUtil.bufferFrameSize(clock.id)) : 512
 
-        self.params = MixParamsStore(tapCount: numTaps)
+        // Input devices, each on its own IOProc/clock, resampled into the
+        // capture clock. Opening a Bluetooth headset's mic switches that
+        // headset to its mono hands-free profile (OS / Bluetooth limit); with
+        // the capture clock on the virtual device that only affects what the
+        // headset itself plays, never the mix rate.
+        var opened: [InputSource?] = []
+        for input in config.inputs {
+            opened.append(InputSource.start(request: input.deviceUID,
+                                            captureRate: captureRate,
+                                            captureBufferFrames: clockBufferFrames,
+                                            maxFrames: maxFrames))
+        }
+        self.inputSources = opened
+        self.inputLaneDeviceIDs = opened.map { $0?.deviceID ?? 0 }
+        self.inputBridgePtrs = .allocate(capacity: max(1, numInputs))
+        self.inputBridgePtrs.initialize(repeating: nil, count: max(1, numInputs))
+        for (j, src) in opened.enumerated() { inputBridgePtrs[j] = src?.bridge.consumerCtxPointer }
+
+        self.params = MixParamsStore(tapCount: numTaps, inputCount: numInputs)
         self.monitorRing = MonitorRing(channels: 2 + 2 * numSources, capacityFrames: Int(captureRate))
         let taps = numTaps
         let names = config.tapNames
         var sourceNames: [String] = (0..<taps).map { i in
             i < names.count ? names[i] : (taps == 1 ? "tap" : "tap \(i + 1)")
         }
-        if hasInput { sourceNames.append("input") }
+        for (j, input) in config.inputs.enumerated() {
+            sourceNames.append(input.name.isEmpty ? (numInputs == 1 ? "input" : "input \(j + 1)") : input.name)
+        }
         self.sourceNames = sourceNames
-        self.monitor = try Monitor(ring: monitorRing, sampleRate: captureRate,
-                                   sourceNames: sourceNames, recordURL: config.recordURL)
+        do {
+            self.monitor = try Monitor(ring: monitorRing, sampleRate: captureRate,
+                                       sourceNames: sourceNames, recordURL: config.recordURL)
+        } catch {
+            for src in opened { src?.stop() }
+            inputBridgePtrs.deallocate()
+            throw error
+        }
         self.fadeFrames = max(1, Int(captureRate * 0.010))
+        self.monitorSlot = .allocate(capacity: 1)
+        self.monitorSlot.initialize(to: nil)
 
         self.busSlots = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: kOpenAudioMaxBuses)
         self.busSlots.initialize(repeating: nil, count: kOpenAudioMaxBuses)
@@ -175,8 +257,10 @@ public final class Engine: @unchecked Sendable {
             params.taps[i].gainDB = i < config.tapGainsDB.count ? config.tapGainsDB[i] : 0
             params.taps[i].pan = i < config.tapPans.count ? config.tapPans[i] : 0
         }
-        params.input.gainDB = config.inputGainDB
-        params.input.pan = config.inputPan
+        for (j, input) in config.inputs.enumerated() {
+            params.inputs[j].gainDB = input.gainDB
+            params.inputs[j].pan = input.pan
+        }
         params.publish()
 
         // Seed the routing matrix.
@@ -193,13 +277,101 @@ public final class Engine: @unchecked Sendable {
         }
         routingWord.store(mask)
 
-        OALog.info(String(format: "Engine config: %d source(s), %d bus(es), capture @ %.0f Hz",
-                          numSources, config.busCount, captureRate))
+        OALog.info(String(format: "Engine config: %d source(s), %d bus(es), capture @ %.0f Hz (clock '%@')",
+                          numSources, config.busCount, captureRate, clockUID))
         OALog.info("Routing matrix: \(routingDescription())")
     }
 
+    /// The capture clock device: OpenAudio's first virtual device (always
+    /// published while the driver is installed; fixed rate, never Bluetooth),
+    /// else the default output.
+    private static func resolveClock() -> (id: AudioObjectID, uid: String, isDefaultOutput: Bool) {
+        let vuid = OpenAudioControl.deviceUID(1)
+        let v = DeviceUtil.device(forUID: vuid)
+        if v != 0 { return (v, vuid, false) }
+        let out = DeviceUtil.defaultOutputDevice()
+        OALog.warn("Virtual device '\(vuid)' not found; clocking capture on the default output (its rate changes will change the mix rate).")
+        return (out, out != 0 ? DeviceUtil.uid(out) : "", true)
+    }
+
     deinit {
+        // Normal paths call stop() first; if not, the capture IOProc (consumer
+        // of the input bridges, producer of the monitor feed) must be gone
+        // before those are freed.
+        captureGraph?.teardown()
+        monitorOut?.detach(from: monitorSlot, captureCycles: captureCycles, producerStopped: true)
+        stopInputs()
         busSlots.deallocate()
+        inputBridgePtrs.deallocate()
+        monitorSlot.deallocate()
+    }
+
+    /// Tap lanes whose direct playback is muted: those routed to the
+    /// monitored bus while monitoring. The listener then hears those sources
+    /// once, through the mix, instead of the original plus a delayed copy
+    /// (which sounds doubled / louder / phasey). Lanes not on the monitored
+    /// bus keep playing directly. Taps are destroyed on stop, which restores
+    /// normal playback.
+    private func desiredTapMuteMask() -> UInt64 {
+        let (bus, _) = unpackMonitor(monitorWord.load())
+        // Only while a monitor feed actually runs — never silence the direct
+        // playback when the monitor output failed to attach.
+        guard bus >= 0, monitorOut != nil else { return 0 }
+        let routing = routingWord.load()
+        var mask: UInt64 = 0
+        for t in 0..<numTaps where (routing & routeBit(source: t, bus: Int(bus))) != 0 {
+            mask |= UInt64(1) << UInt64(t)
+        }
+        return mask
+    }
+
+    /// Control queue only.
+    private func applyTapMutes() {
+        captureGraph?.setTapMuteMask(desiredTapMuteMask())
+    }
+
+    /// (Re)attach the monitor feed to the current default output, or drop it
+    /// when monitoring is off. Control queue only.
+    private func syncMonitorOutput(reason: String? = nil) {
+        let (bus, _) = unpackMonitor(monitorWord.load())
+        if let m = monitorOut {
+            m.detach(from: monitorSlot, captureCycles: captureCycles, producerStopped: captureGraph == nil)
+            monitorOut = nil
+        }
+        guard bus >= 0, !stopping else { applyTapMutes(); return }
+        if let reason { OALog.event("Re-attaching monitor output — \(reason)") }
+        do {
+            let m = try MonitorOutput.attach(captureRate: graphRate,
+                                             captureBufferFrames: clockBufferFrames,
+                                             maxFrames: maxFrames)
+            m.publish(into: monitorSlot)
+            monitorOut = m
+        } catch {
+            OALog.error("Monitor output unavailable: \(error)")
+        }
+        applyTapMutes()
+    }
+
+    /// Stop every input IOProc. Only after the capture graph (the bridges'
+    /// consumer) has been torn down. Idempotent.
+    private func stopInputs() {
+        for j in 0..<inputSources.count {
+            inputSources[j]?.stop()
+            inputSources[j] = nil
+            inputBridgePtrs[j] = nil
+        }
+    }
+
+    private func buildCaptureGraph() throws -> CaptureGraph {
+        try CaptureGraph.build(
+            mode: config.tapMode, clockDeviceUID: clockUID, monitorSlot: monitorSlot,
+            monitorInputsWord: monitorInputsWord.raw,
+            tapMuteMask: desiredTapMuteMask(),
+            inputBridges: inputBridgePtrs, numInputs: numInputs,
+            busSlots: busSlots, maxBuses: kOpenAudioMaxBuses,
+            routingWord: routingWord.raw, captureCycles: captureCycles.raw,
+            monRing: monitorRing, params: params, monitorWord: monitorWord.raw,
+            maxFrames: maxFrames, fadeFrames: fadeFrames)
     }
 
     // MARK: Lifecycle
@@ -227,13 +399,9 @@ public final class Engine: @unchecked Sendable {
 
         // 2. Capture graph (producer). Bridges already consuming (silence until prefill).
         do {
-            captureGraph = try CaptureGraph.build(
-                mode: config.tapMode, inputDeviceUID: config.inputDeviceUID,
-                busSlots: busSlots, maxBuses: kOpenAudioMaxBuses,
-                routingWord: routingWord.raw, captureCycles: captureCycles.raw,
-                monRing: monitorRing, params: params, monitorWord: monitorWord.raw,
-                maxFrames: maxFrames, fadeFrames: fadeFrames)
+            captureGraph = try buildCaptureGraph()
         } catch {
+            stopInputs()
             for i in 0..<kOpenAudioMaxBuses {
                 buses[i]?.detach(from: busSlots, captureCycles: captureCycles, producerStopped: true)
                 buses[i] = nil
@@ -262,6 +430,9 @@ public final class Engine: @unchecked Sendable {
             // callback can observe the slots, so bus detach is immediately safe.
             captureGraph?.teardown()
             captureGraph = nil
+            monitorOut?.detach(from: monitorSlot, captureCycles: captureCycles, producerStopped: true)
+            monitorOut = nil
+            stopInputs()
             for i in 0..<kOpenAudioMaxBuses {
                 buses[i]?.detach(from: busSlots, captureCycles: captureCycles, producerStopped: true)
                 buses[i] = nil
@@ -282,7 +453,7 @@ public final class Engine: @unchecked Sendable {
         controlQueue.sync {
             switch source {
             case .tap(let i) where i >= 0 && i < numTaps: params.taps[i].gainDB = dB
-            case .input where hasInput:                   params.input.gainDB = dB
+            case .input(let j) where j >= 0 && j < numInputs: params.inputs[j].gainDB = dB
             default: return
             }
             params.publish()
@@ -293,7 +464,7 @@ public final class Engine: @unchecked Sendable {
         controlQueue.sync {
             switch source {
             case .tap(let i) where i >= 0 && i < numTaps: params.taps[i].muted = muted
-            case .input where hasInput:                   params.input.muted = muted
+            case .input(let j) where j >= 0 && j < numInputs: params.inputs[j].muted = muted
             default: return
             }
             params.publish()
@@ -304,7 +475,7 @@ public final class Engine: @unchecked Sendable {
         controlQueue.sync {
             switch source {
             case .tap(let i) where i >= 0 && i < numTaps: params.taps[i].pan = pan
-            case .input where hasInput:                   params.input.pan = pan
+            case .input(let j) where j >= 0 && j < numInputs: params.inputs[j].pan = pan
             default: return
             }
             params.publish()
@@ -321,11 +492,13 @@ public final class Engine: @unchecked Sendable {
             var m = routingWord.load()
             if on { m |= bit } else { m &= ~bit }
             routingWord.store(m)
+            applyTapMutes()
         }
     }
 
     /// Route a bus's stereo mix to the real default output device for
-    /// monitoring (F-M1/M2), or turn monitoring off. `busIndex` is 0-based;
+    /// monitoring (F-M1/M2; fed through MonitorOutput on that device's own
+    /// clock), or turn monitoring off. `busIndex` is 0-based;
     /// pass nil (or an out-of-range index) to disable. `gainDB` is applied as a
     /// linear factor on the monitor path only. Off-RT: the capture callback
     /// picks up the new packed snapshot atomically on its next cycle. The
@@ -344,15 +517,26 @@ public final class Engine: @unchecked Sendable {
                 }
                 let gain = powf(10, gainDB / 20)
                 monitorWord.store(packMonitor(bus: Int32(b), gain: gain))
+                if monitorOut == nil { syncMonitorOutput() }
+                applyTapMutes()
                 OALog.info(String(format: "Monitor -> bus %d @ %+.1f dB", b + 1, gainDB))
             } else {
                 if let b = busIndex {
                     OALog.warn("Monitor bus index out of range (\(b + 1)); monitoring off.")
                 }
                 monitorWord.store(packMonitor(bus: -1, gain: 1))
+                applyTapMutes()
+                syncMonitorOutput()
                 OALog.info("Monitor off.")
             }
         }
+    }
+
+    /// Whether the monitor feed also carries the microphone / input lanes.
+    /// Off by default; buses and recordings always include them.
+    public func setMonitorIncludesInputs(_ on: Bool) {
+        monitorInputsWord.store(on ? 1 : 0)
+        OALog.info("Monitor microphones: \(on ? "on" : "off")")
     }
 
     /// Current monitor selection: (0-based bus index or nil if off, gain dB).
@@ -372,7 +556,7 @@ public final class Engine: @unchecked Sendable {
             if stopping { thrown = OAError("engine is stopping"); return }
             if buses[index] != nil { thrown = OAError("bus \(index + 1) already attached"); return }
             do {
-                let bus = try Bus.attach(index: index, captureRate: captureRate,
+                let bus = try Bus.attach(index: index, captureRate: graphRate,
                                          output: config.outputMode)
                 buses[index] = bus
                 bus.publish(into: busSlots)
@@ -393,6 +577,7 @@ public final class Engine: @unchecked Sendable {
             var m = routingWord.load()
             for s in 0..<numSources { m &= ~routeBit(source: s, bus: index) }
             routingWord.store(m)
+            applyTapMutes()
         }
         if let thrown { throw thrown }
     }
@@ -403,7 +588,7 @@ public final class Engine: @unchecked Sendable {
         controlQueue.sync { (0..<kOpenAudioMaxBuses).filter { buses[$0] != nil } }
     }
 
-    /// Human-readable matrix, e.g. "tap->[1,2] input->[1]".
+    /// Human-readable matrix, e.g. "tap->1,2 input->1".
     public func routingDescription() -> String {
         let m = routingWord.load()
         let names = sourceNames
@@ -466,25 +651,39 @@ public final class Engine: @unchecked Sendable {
         OALog.event("Rebuilding capture graph — \(reason)")
         captureGraph?.teardown()
         captureGraph = nil
+        // Re-resolve the clock (the driver may have come or gone) and read its
+        // rate BEFORE building: the aggregate adopts the main sub-device's
+        // current rate, and graphRate must describe this graph.
+        let clock = Self.resolveClock()
+        clockUID = clock.uid
+        clockIsDefaultOutput = clock.isDefaultOutput
+        let newRate = clock.id != 0 ? DeviceUtil.nominalSampleRate(clock.id) : 0
+        let rateChanged = newRate > 0 && abs(newRate - graphRate) > 0.5
+        // Adopt it even if this build fails: the 1 s retry chain below owns
+        // recovery, and the watchdog must not start a second chain for the
+        // same rate change.
+        if newRate > 0 { graphRate = newRate }
         do {
-            captureGraph = try CaptureGraph.build(
-                mode: config.tapMode, inputDeviceUID: config.inputDeviceUID,
-                busSlots: busSlots, maxBuses: kOpenAudioMaxBuses,
-                routingWord: routingWord.raw, captureCycles: captureCycles.raw,
-                monRing: monitorRing, params: params, monitorWord: monitorWord.raw,
-                maxFrames: maxFrames, fadeFrames: fadeFrames)
+            captureGraph = try buildCaptureGraph()
             lastProduced = captureCycles.load()
             monitor.resetSilenceBaseline()
 
-            // The new default output device (aggregate clock master) may run at
-            // a different nominal rate; retune every bus bridge's base ratio so
-            // the PI only absorbs ppm-scale residuals, not the whole rate gap.
-            let outDev = DeviceUtil.defaultOutputDevice()
-            let newRate = outDev != 0 ? DeviceUtil.nominalSampleRate(outDev) : 0
+            // The clock may now run at a different nominal rate; retune every
+            // bridge's base ratio so the PI only absorbs ppm-scale residuals,
+            // not the whole rate gap (the monitor feed is re-attached).
             if newRate > 0 {
+                if rateChanged || monitorOut == nil {
+                    syncMonitorOutput(reason: "capture rate now \(Int(newRate)) Hz")
+                }
+                for src in inputSources { src?.retune(captureRate: newRate) }
                 for i in 0..<kOpenAudioMaxBuses {
                     guard let b = buses[i] else { continue }
-                    let newBase = newRate / b.deviceRate
+                    // Re-read the bus device's rate: it may be the clock device
+                    // itself (OpenAudioDevice-1), which just changed rate.
+                    let dr = DeviceUtil.nominalSampleRate(b.vdevID)
+                    let devRate = dr > 0 ? dr : b.deviceRate
+                    b.bridge.consumerCtxPointer.pointee.sampleRate = devRate   // PI dt; aligned store
+                    let newBase = newRate / devRate
                     if abs(newBase - b.bridge.currentBaseRatio()) > 1e-9 {
                         b.bridge.setBaseRatio(newBase)
                         OALog.event(String(format: "Bus %d: capture rate now %.0f Hz; base ratio retuned to %.6f",
@@ -516,6 +715,33 @@ public final class Engine: @unchecked Sendable {
 
     private func watchdogTick() {
         if stopping { return }
+        // The clock device's rate changed (user retuned the virtual device, or
+        // — in the no-driver fallback — the output's Bluetooth profile moved):
+        // the aggregate follows it, so rebuild and retune every bridge.
+        let clockDev = DeviceUtil.device(forUID: clockUID)
+        let curRate = clockDev != 0 ? DeviceUtil.nominalSampleRate(clockDev) : 0
+        if curRate > 0 && abs(curRate - graphRate) > 0.5 {
+            rebuildCapture(reason: String(format: "clock sample rate changed (%.0f -> %.0f Hz)",
+                                          graphRate, curRate))
+            return
+        }
+        // The monitor feed follows the real output: a Bluetooth headset
+        // switching between its stereo and hands-free profiles (whenever any
+        // app opens / releases its mic) changes only that feed's rate.
+        // (Also retries a monitor feed that failed to attach.)
+        if unpackMonitor(monitorWord.load()).0 >= 0 {
+            let out = DeviceUtil.defaultOutputDevice()
+            let outRate = out != 0 ? DeviceUtil.nominalSampleRate(out) : 0
+            if let m = monitorOut {
+                if out != m.deviceID || (outRate > 0 && abs(outRate - m.deviceRate) > 0.5) {
+                    syncMonitorOutput(reason: String(format: "output now %.0f Hz", outRate))
+                }
+            } else if out != 0 {
+                syncMonitorOutput(reason: "retrying monitor output")
+            }
+        }
+        // Inputs can change rate on their own too; keep their ratios honest.
+        for src in inputSources { src?.retune(captureRate: graphRate) }
         let produced = captureCycles.load()
         let firing = produced != lastProduced
         lastProduced = produced
@@ -534,13 +760,32 @@ public final class Engine: @unchecked Sendable {
     private func installDeviceListener() {
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             guard let self else { return }
-            self.controlQueue.async { self.rebuildCapture(reason: "default output device changed") }
+            self.controlQueue.async { self.defaultOutputChanged() }
         }
         deviceListenerBlock = block
         let status = AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject), &deviceListenerAddr, controlQueue, block)
         if status != noErr {
             OALog.warn("Could not register default-output-device listener: OSStatus \(osStatusString(status))")
+        }
+    }
+
+    /// Only the monitor feed (and, in the no-driver fallback, the clock)
+    /// depends on the default output.
+    private func defaultOutputChanged() {
+        if stopping { return }
+        // Tap attenuation compensation is derived from the default output's
+        // channel-pair count; rebuild when that changes (or when the output
+        // also clocks the capture).
+        let out = DeviceUtil.defaultOutputDevice()
+        let outCh = out != 0 ? DeviceUtil.channelCount(out, scope: kAudioObjectPropertyScopeOutput) : 2
+        let pairs = max(1, (outCh + 1) / 2)
+        let comp: Float = pairs > 1 ? Float(pairs) : 1
+        if clockIsDefaultOutput || captureGraph == nil || abs((captureGraph?.compGain ?? comp) - comp) > 1e-6 {
+            rebuildCapture(reason: "default output device changed")
+        }
+        if unpackMonitor(monitorWord.load()).0 >= 0 {
+            syncMonitorOutput(reason: "default output device changed")
         }
     }
 

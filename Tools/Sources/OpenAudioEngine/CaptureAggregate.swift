@@ -1,11 +1,16 @@
 // CaptureAggregate.swift
-// Builds ONE private aggregate (NF-S1): default output device as main
-// sub-device + one process tap PER SOURCE LANE (a system-wide tap, or one tap
-// per selected app) + optionally a real input device (drift-compensated inside
-// the aggregate; NF-S2 — the app adds no second SRC). A single IOProc captures
-// all source streams in one callback, applies per-lane gain/mute/pan + tap
+// Builds ONE private aggregate (NF-S1): a CLOCK device as main sub-device
+// (OpenAudio's own virtual device, so the mix never follows a Bluetooth
+// headset down to its 16/24 kHz hands-free rate; the default output only as a
+// fallback when the driver is absent) + one process tap PER SOURCE LANE (a system-wide tap, or one tap
+// per selected app). Real input devices (microphones / interfaces, including
+// Bluetooth headsets) are NOT sub-devices: each runs on its own IOProc/clock
+// and is resampled into this clock through its own ClockBridge (InputSource),
+// so any input rate mixes cleanly. A single IOProc captures all tap streams
+// in one callback, pulls every input lane, applies per-lane gain/mute/pan + tap
 // attenuation compensation + a short splice fade-in, sums to ONE stereo bus
-// per routed bus, and pushes each bus into its bridge ring (audio-critical)
+// per routed bus, and pushes each bus into its bridge ring (audio-critical),
+// the monitored bus into the MonitorOutput bridge (real output, own clock),
 // and the full mix into a monitor ring (off-RT meters/recording).
 
 import Foundation
@@ -29,18 +34,33 @@ public struct CaptureCtx {
     public var numTaps: Int            // >= 1 (a placeholder silent tap exists in input-only mode)
     public var tapBufIndices: UnsafeMutablePointer<Int32>   // numTaps entries
     public var tapChannels: UnsafeMutablePointer<Int32>     // numTaps entries
-    public var inputBufIndex: Int      // -1 if no input device
-    public var inputChannels: Int
-    public var numSources: Int         // numTaps (+1 with input)
+    /// Input-device lanes (numInputs entries): each is the consumer side of
+    /// that input's own ClockBridge (the input runs on its own IOProc/clock and
+    /// is resampled to the capture rate), or nil when the device could not be
+    /// opened (the lane then stays silent so lane indexing is stable).
+    public var inputBridges: UnsafeMutablePointer<UnsafeMutablePointer<ConsumerCtx>?>
+    public var numInputs: Int
+    public var numSources: Int         // numTaps + numInputs
+    /// Aggregate IO buffer size, the last-resort cycle length when no tap
+    /// buffer is resolvable (input-only engine on a silent placeholder tap).
+    public var ioBufferFrames: Int
     public var compGain: Float         // tap attenuation compensation
 
     // Mix params: packed (L,R) gain words, one aligned 64-bit load each.
-    // Index 0..<numTaps = tap lanes, index numTaps = input.
+    // Index 0..<numTaps = tap lanes, numTaps + j = input lane j.
     public var gainWords: UnsafeMutablePointer<UInt64>
 
     // Monitor selection: packed (Int32 busIndex, Float linear-gain) word
     // (F-M1/M2). busIndex < 0 == off. Single aligned load in the callback.
     public var monitorWord: UnsafeMutablePointer<UInt64>
+    // One-entry slot: BusRTContext of the MonitorOutput bridge (nil == no
+    // monitor feed attached). Published/retired off-RT like bus slots.
+    public var monitorSlot: UnsafeMutablePointer<UnsafeMutableRawPointer?>
+    public var monScratch: UnsafeMutablePointer<Float>    // stereo, gain-applied
+    // Non-zero == the monitor feed also carries the input (mic) lanes. Off by
+    // default: hearing a headset's own mic back in that headset is delayed
+    // self-echo at best and an acoustic feedback loop at worst.
+    public var monitorInputsWord: UnsafeMutablePointer<UInt64>
 
     // Scratch buffers (preallocated). srcScratch holds one stereo interleaved
     // lane per source, lane s at offset s * maxFrames * 2.
@@ -73,13 +93,9 @@ public struct CaptureCtx {
 public func captureProcess(_ ctxPtr: UnsafeMutablePointer<CaptureCtx>,
                            _ inInputData: UnsafePointer<AudioBufferList>,
                            _ outOutputData: UnsafeMutablePointer<AudioBufferList>?) {
-    // --- Monitoring (F-M1/M2). The aggregate's main sub-device IS the real
-    // default output, so writing the selected bus mix into THIS callback's
-    // output ABL passes it through on the same clock (no SRC, no extra IOProc).
-    // Read the packed snapshot with a single aligned load; zero every output
-    // buffer up front so we never leak stale samples into the output device
-    // when monitoring is off or the selected bus is absent. The monitor mix (if
-    // any) is written into channels 0/1 during the bus fan-out pass below.
+    // --- Monitoring (F-M1/M2) goes to the MonitorOutput bridge (the real
+    // output runs on its own clock). This aggregate's own output streams are
+    // the clock device's; zero them so nothing stale is ever played there.
     let (monBus, monGain) = unpackMonitor(ctxPtr.pointee.monitorWord.pointee)
     var outList: UnsafeMutableAudioBufferListPointer? = nil
     if let outOutputData {
@@ -98,10 +114,9 @@ public func captureProcess(_ ctxPtr: UnsafeMutablePointer<CaptureCtx>,
     let tapBufIndices = ctxPtr.pointee.tapBufIndices
     let tapChannels = ctxPtr.pointee.tapChannels
 
-    // Frame count for this cycle: from the first resolvable tap buffer, else
-    // the input buffer (per-lane reads clamp to their own buffer sizes below).
-    let inputIdx = ctxPtr.pointee.inputBufIndex
-    let inputChannels = ctxPtr.pointee.inputChannels
+    // Frame count for this cycle: from the first resolvable tap buffer (tap
+    // lanes clamp to their own buffer sizes below; input lanes are resampled
+    // to exactly this count).
     var frames = 0
     var t = 0
     while t < numTaps {
@@ -113,9 +128,11 @@ public func captureProcess(_ ctxPtr: UnsafeMutablePointer<CaptureCtx>,
         }
         t += 1
     }
-    if frames == 0, inputIdx >= 0 && inputIdx < nbuf, inputChannels > 0 {
-        frames = Int(bufs[inputIdx].mDataByteSize) / (inputChannels * MemoryLayout<Float>.size)
+    if frames == 0, let ol = outList, ol.count > 0 {
+        let ch = Int(ol[0].mNumberChannels)
+        if ch > 0 { frames = Int(ol[0].mDataByteSize) / (ch * MemoryLayout<Float>.size) }
     }
+    if frames == 0 { frames = ctxPtr.pointee.ioBufferFrames }
     let n = min(frames, ctxPtr.pointee.maxFrames)
     if n <= 0 { return }
 
@@ -141,8 +158,8 @@ public func captureProcess(_ ctxPtr: UnsafeMutablePointer<CaptureCtx>,
     }
 
     // Pass 1: render each source's per-frame stereo into its scratch lane
-    // (gain / comp / pan / fade). Lanes 0..<numTaps are taps; lane numTaps is
-    // the input device (when present). Each lane clamps to its own buffer size.
+    // (gain / comp / pan / fade). Lanes 0..<numTaps are taps, then one lane per
+    // input device. Each tap lane clamps to its own buffer size.
     var s = 0
     while s < numTaps {
         let lane = srcScratch + s * laneStride
@@ -170,28 +187,27 @@ public func captureProcess(_ ctxPtr: UnsafeMutablePointer<CaptureCtx>,
         while i < n { lane[i * 2] = 0; lane[i * 2 + 1] = 0; i += 1 }
         s += 1
     }
-    if inputIdx >= 0 {
-        let lane = srcScratch + numTaps * laneStride
-        var srcFrames = 0
-        var ip: UnsafeMutablePointer<Float>? = nil
-        if inputIdx < nbuf, inputChannels > 0, let idata = bufs[inputIdx].mData {
-            ip = idata.assumingMemoryBound(to: Float.self)
-            srcFrames = Int(bufs[inputIdx].mDataByteSize) / (inputChannels * MemoryLayout<Float>.size)
-        }
-        let (gL, gR) = unpackGainPair(gainWords[numTaps])
-        var i = 0
-        if let ip {
-            let m = min(n, srcFrames)
-            while i < m {
+    let numInputs = ctxPtr.pointee.numInputs
+    let inputBridges = ctxPtr.pointee.inputBridges
+    var j = 0
+    while j < numInputs {
+        let lane = srcScratch + (numTaps + j) * laneStride
+        if let bridge = inputBridges[j] {
+            // Pull n frames at the capture rate from this input's own bridge
+            // (variable-ratio resample: any input rate -> capture rate).
+            bridgeConsume(bridge, out: lane, frames: n, channels: 2)
+            let (gL, gR) = unpackGainPair(gainWords[numTaps + j])
+            var i = 0
+            while i < n {
                 let k = fadeK(i)
-                let l = ip[i * inputChannels]
-                let r = inputChannels > 1 ? ip[i * inputChannels + 1] : l
-                lane[i * 2]     = l * gL * k
-                lane[i * 2 + 1] = r * gR * k
+                lane[i * 2]     *= gL * k
+                lane[i * 2 + 1] *= gR * k
                 i += 1
             }
+        } else {
+            memset(lane, 0, n * 2 * MemoryLayout<Float>.size)
         }
-        while i < n { lane[i * 2] = 0; lane[i * 2 + 1] = 0; i += 1 }
+        j += 1
     }
     if fadeRemaining > 0 {
         ctxPtr.pointee.fadeRemaining = max(0, fadeRemaining - n)
@@ -262,49 +278,38 @@ public func captureProcess(_ ctxPtr: UnsafeMutablePointer<CaptureCtx>,
                    frames: n)
         bc.pointee.producerCallbacks.pointee = bc.pointee.producerCallbacks.pointee &+ 1
 
-        // Monitor pass-through: if this is the selected bus, write its stereo
-        // mix (already fade/route-applied in busAccum) into the output device,
-        // scaled by the monitor gain. Untouched channels keep the zero we wrote
-        // up front. The tap excludes our own process, so this write is never
-        // re-captured (no howl loop). Handles the two output ABL layouts
-        // defensively: interleaved (buffer 0 with >=2 ch) and non-interleaved
-        // (one mono buffer per channel); a genuinely mono device gets L+R.
-        if monBus >= 0, Int(monBus) == b, let ol = outList, ol.count > 0, let od0 = ol[0].mData {
-            let ch0 = Int(ol[0].mNumberChannels)
-            if ch0 >= 2 {
-                // Interleaved stereo (or more) in buffer 0.
-                let outFrames = Int(ol[0].mDataByteSize) / (ch0 * MemoryLayout<Float>.size)
-                let m = min(n, outFrames)
-                let op = od0.assumingMemoryBound(to: Float.self)
-                var f = 0
-                while f < m {
-                    op[f * ch0]     = busAccum[f * 2]     * monGain
-                    op[f * ch0 + 1] = busAccum[f * 2 + 1] * monGain
-                    f += 1
+        // Monitor feed: the selected bus's mix (fade/route already applied),
+        // scaled by the monitor gain, into the MonitorOutput bridge. The tap
+        // excludes our own process, so the monitor is never re-captured.
+        if monBus >= 0, Int(monBus) == b {
+            OSMemoryBarrier()
+            if let mraw = ctxPtr.pointee.monitorSlot[0] {
+                let mc = mraw.assumingMemoryBound(to: BusRTContext.self)
+                let ms = ctxPtr.pointee.monScratch
+                if numInputs == 0 || ctxPtr.pointee.monitorInputsWord.pointee != 0 {
+                    var f = 0
+                    while f < n2 { ms[f] = busAccum[f] * monGain; f += 1 }
+                } else {
+                    // The bus mix minus its input lanes: re-sum the routed taps.
+                    memset(ms, 0, n2 * MemoryLayout<Float>.size)
+                    var tc = 0
+                    while tc < numTaps {
+                        if (routing & routeBit(source: tc, bus: b)) != 0 {
+                            let lane = srcScratch + tc * laneStride
+                            var f = 0
+                            while f < n2 { ms[f] += lane[f]; f += 1 }
+                        }
+                        tc += 1
+                    }
+                    var f = 0
+                    while f < n2 { ms[f] *= monGain; f += 1 }
                 }
-            } else if ch0 == 1, ol.count >= 2, Int(ol[1].mNumberChannels) == 1, let od1 = ol[1].mData {
-                // Non-interleaved stereo: L -> buffer 0, R -> buffer 1.
-                let f0 = Int(ol[0].mDataByteSize) / MemoryLayout<Float>.size
-                let f1 = Int(ol[1].mDataByteSize) / MemoryLayout<Float>.size
-                let m = min(n, min(f0, f1))
-                let lp = od0.assumingMemoryBound(to: Float.self)
-                let rp = od1.assumingMemoryBound(to: Float.self)
-                var f = 0
-                while f < m {
-                    lp[f] = busAccum[f * 2]     * monGain
-                    rp[f] = busAccum[f * 2 + 1] * monGain
-                    f += 1
-                }
-            } else if ch0 == 1 {
-                // Genuinely mono output device: downmix L+R.
-                let outFrames = Int(ol[0].mDataByteSize) / MemoryLayout<Float>.size
-                let m = min(n, outFrames)
-                let op = od0.assumingMemoryBound(to: Float.self)
-                var f = 0
-                while f < m {
-                    op[f] = (busAccum[f * 2] + busAccum[f * 2 + 1]) * 0.5 * monGain
-                    f += 1
-                }
+                bridgePush(storage: mc.pointee.storage,
+                           capacityFrames: mc.pointee.capacityFrames,
+                           writeIndex: mc.pointee.writeIndex,
+                           producedFrames: mc.pointee.producedFrames,
+                           src: ms, frames: n)
+                mc.pointee.producerCallbacks.pointee = mc.pointee.producerCallbacks.pointee &+ 1
             }
         }
         b += 1
@@ -321,6 +326,9 @@ public func captureProcess(_ ctxPtr: UnsafeMutablePointer<CaptureCtx>,
 /// watchdog / device-change handler; the bridge + monitor rings persist.
 public final class CaptureGraph {
     public let tapIDs: [AudioObjectID]
+    private let tapDescriptions: [CATapDescription]
+    /// Bit t set == lane t's direct playback is muted while tapped.
+    public private(set) var tapMuteMask: UInt64
     public let aggregateID: AudioObjectID
     private let ioProcID: AudioDeviceIOProcID
     public let format: AudioStreamBasicDescription
@@ -337,10 +345,13 @@ public final class CaptureGraph {
     private let srcScratch: UnsafeMutablePointer<Float>
     private let busAccum: UnsafeMutablePointer<Float>
     private let mon: UnsafeMutablePointer<Float>
+    private let monScratch: UnsafeMutablePointer<Float>
     private var started = false
     private var tornDown = false
 
     private init(tapIDs: [AudioObjectID],
+                 tapDescriptions: [CATapDescription],
+                 tapMuteMask: UInt64,
                  aggregateID: AudioObjectID,
                  ioProcID: AudioDeviceIOProcID,
                  format: AudioStreamBasicDescription,
@@ -351,8 +362,11 @@ public final class CaptureGraph {
                  tapChannelsPtr: UnsafeMutablePointer<Int32>,
                  srcScratch: UnsafeMutablePointer<Float>,
                  busAccum: UnsafeMutablePointer<Float>,
-                 mon: UnsafeMutablePointer<Float>) {
+                 mon: UnsafeMutablePointer<Float>,
+                 monScratch: UnsafeMutablePointer<Float>) {
         self.tapIDs = tapIDs
+        self.tapDescriptions = tapDescriptions
+        self.tapMuteMask = tapMuteMask
         self.aggregateID = aggregateID
         self.ioProcID = ioProcID
         self.format = format
@@ -364,12 +378,18 @@ public final class CaptureGraph {
         self.srcScratch = srcScratch
         self.busAccum = busAccum
         self.mon = mon
+        self.monScratch = monScratch
     }
 
     // MARK: Build
 
     public static func build(mode: EngineTapMode,
-                             inputDeviceUID: String?,
+                             clockDeviceUID: String,
+                             monitorSlot: UnsafeMutablePointer<UnsafeMutableRawPointer?>,
+                             monitorInputsWord: UnsafeMutablePointer<UInt64>,
+                             tapMuteMask: UInt64,
+                             inputBridges: UnsafeMutablePointer<UnsafeMutablePointer<ConsumerCtx>?>,
+                             numInputs: Int,
                              busSlots: UnsafeMutablePointer<UnsafeMutableRawPointer?>,
                              maxBuses: Int,
                              routingWord: UnsafeMutablePointer<UInt64>,
@@ -428,14 +448,23 @@ public final class CaptureGraph {
         guard numTaps == params.tapCount else {
             throw OAError("Tap lane count mismatch: \(numTaps) taps vs \(params.tapCount) param lanes")
         }
+        guard numInputs == params.inputCount,
+              monRing.channels >= 2 + 2 * (numTaps + numInputs) else {
+            throw OAError("Lane layout mismatch: \(numTaps) tap(s) + \(numInputs) input(s) vs " +
+                          "\(params.inputCount) input param lane(s), \(monRing.channels) monitor ch")
+        }
 
         // 2. Create the taps (destroy all created so far on any failure).
         var tapIDs: [AudioObjectID] = []
+        var usedDescriptions: [CATapDescription] = []
         func destroyTaps() { for id in tapIDs { AudioHardwareDestroyProcessTap(id) } }
         func createTap(_ description: CATapDescription, _ i: Int) -> AudioObjectID? {
             description.name = "OpenAudio-Engine-Tap-\(i + 1)"
             description.isPrivate = true
-            description.muteBehavior = .unmuted
+            // Lanes heard through the monitor have their direct playback
+            // muted (only while our IOProc reads the tap), so the listener
+            // hears the mix once instead of original + delayed copy.
+            description.muteBehavior = (tapMuteMask >> UInt64(i)) & 1 != 0 ? .mutedWhenTapped : .unmuted
             var tapID: AudioObjectID = 0
             let status = AudioHardwareCreateProcessTap(description, &tapID)
             guard status == noErr, tapID != 0 else {
@@ -445,12 +474,14 @@ public final class CaptureGraph {
             return tapID
         }
         for (i, description) in descriptions.enumerated() {
+            var used = description
             var tapID = createTap(description, i)
             if tapID == nil, allowPlaceholderFallback {
                 // The app behind this lane likely quit; keep the lane (and the
                 // gain-word / meter indexing) alive with a silent placeholder.
                 OALog.warn("Lane \(i + 1): falling back to a silent placeholder tap.")
-                tapID = createTap(CATapDescription(stereoMixdownOfProcesses: []), i)
+                used = CATapDescription(stereoMixdownOfProcesses: [])
+                tapID = createTap(used, i)
             }
             guard let tapID else {
                 destroyTaps()
@@ -459,6 +490,7 @@ public final class CaptureGraph {
                     "System audio-capture permission (TCC) may be required for the hosting terminal.")
             }
             tapIDs.append(tapID)
+            usedDescriptions.append(used)
         }
 
         var teardownOwns = false
@@ -476,42 +508,27 @@ public final class CaptureGraph {
                 tapFormats.append(format)
             }
 
-            // 3. Default output device (aggregate main / clock master).
-            let outputDevice = DeviceUtil.defaultOutputDevice()
-            guard outputDevice != 0 else { throw OAError("No default output device is set") }
-            let outputUID = try CAProperty.string(outputDevice, kAudioDevicePropertyDeviceUID)
+            // 3. Clock device (aggregate main / clock master).
+            let clockDevice = DeviceUtil.device(forUID: clockDeviceUID)
+            guard clockDevice != 0 else { throw OAError("Clock device '\(clockDeviceUID)' not found") }
+            let outputUID = clockDeviceUID
 
-            // Attenuation compensation from output device pair count.
-            let outCh = DeviceUtil.channelCount(outputDevice, scope: kAudioObjectPropertyScopeOutput)
+            // Attenuation compensation from the DEFAULT OUTPUT device's pair
+            // count (unchanged basis from the Phase 0 spike; independent of
+            // which device clocks the aggregate).
+            let outputDevice = DeviceUtil.defaultOutputDevice()
+            let outCh = outputDevice != 0
+                ? DeviceUtil.channelCount(outputDevice, scope: kAudioObjectPropertyScopeOutput) : 2
             let pairCount = max(1, (outCh + 1) / 2)
             let compGain: Float = pairCount > 1 ? Float(pairCount) : 1.0
 
-            // 4. Optional real input device sub-device (drift-compensated).
-            var inputUID: String? = nil
-            var inputChannels = 0
-            if let req = inputDeviceUID {
-                let inDev = (req == "default") ? DeviceUtil.defaultInputDevice() : DeviceUtil.device(forUID: req)
-                if inDev != 0 {
-                    inputChannels = DeviceUtil.channelCount(inDev, scope: kAudioObjectPropertyScopeInput)
-                    if inputChannels > 0 {
-                        inputUID = DeviceUtil.uid(inDev)
-                    } else {
-                        OALog.warn("Requested input device has no input channels; ignoring input source.")
-                    }
-                } else {
-                    OALog.warn("Requested input device '\(req)' not found; ignoring input source.")
-                }
-            }
-
             // 5. Build the private aggregate.
             let aggUID = "OpenAudio-Engine-Agg-" + UUID().uuidString
-            var subDevices: [[String: Any]] = [[kAudioSubDeviceUIDKey: outputUID]]
-            if let inputUID, inputUID != outputUID {
-                subDevices.append([
-                    kAudioSubDeviceUIDKey: inputUID,
-                    kAudioSubDeviceDriftCompensationKey: true,
-                ])
-            }
+            // Input devices are NOT sub-devices: each runs on its own IOProc
+            // and is resampled into this clock (InputSource), so they may have
+            // any sample rate and never pull a Bluetooth headset's mic into
+            // this aggregate implicitly.
+            let subDevices: [[String: Any]] = [[kAudioSubDeviceUIDKey: outputUID]]
             let desc: [String: Any] = [
                 kAudioAggregateDeviceNameKey: "OpenAudio-Engine",
                 kAudioAggregateDeviceUIDKey: aggUID,
@@ -533,29 +550,27 @@ public final class CaptureGraph {
                       "AudioHardwareCreateAggregateDevice")
             guard aggregateID != 0 else { throw OAError("AudioHardwareCreateAggregateDevice returned null") }
 
-            // 6. Determine the source buffer layout from the aggregate's input
-            // streams. Convention observed on macOS (verified empirically for
-            // the single-tap case): sub-device input streams precede the tap
-            // streams, and taps appear in tap-list order — so the taps are the
-            // LAST numTaps buffers and the input device (when present) is
-            // buffer 0.
+            // 6. Source buffer layout: the aggregate's input streams are the
+            // main sub-device's own input streams (if any) followed by the tap
+            // streams in tap-list order, so the taps are the LAST numTaps buffers.
             let layout = DeviceUtil.streamChannelLayout(aggregateID, scope: kAudioObjectPropertyScopeInput)
             OALog.info("Aggregate input stream layout (channels per buffer): \(layout)")
-            var inputBufIndex = -1
-            var effInputChannels = 0
-            let firstTapBuf = max(0, layout.count - numTaps)
-            if inputUID != nil && inputChannels > 0 && firstTapBuf > 0 {
-                inputBufIndex = 0
-                effInputChannels = layout.first ?? inputChannels
+            // Taps start right after the clock device's own input streams (the
+            // virtual device's loopback). Index from that count — never from
+            // the end — so a tap stream missing from the layout can only leave
+            // its lane silent, never alias it onto the loopback (= a bus
+            // feeding itself back).
+            let mainInputStreams = DeviceUtil.streamChannelLayout(clockDevice, scope: kAudioObjectPropertyScopeInput).count
+            let firstTapBuf = min(mainInputStreams, layout.count)
+            if layout.count != mainInputStreams + numTaps {
+                OALog.warn("Aggregate exposes \(layout.count - firstTapBuf) tap stream(s) for \(numTaps) tap(s); missing lanes stay silent.")
             }
-            let numSources = numTaps + (inputBufIndex >= 0 ? 1 : 0)
+            let numSources = numTaps + numInputs
             // The monitor ring's channel count is authoritative for the RT
             // write stride: MonitorRing.write copies `ring.channels` floats per
-            // frame. The ring is sized off the engine's configured source count
-            // (numTaps + hasInput), which is >= the count actually resolved
-            // here (an `--input` device can fail to resolve). Match `mon` to
-            // the ring so the RT write can never overrun; unresolved input
-            // columns stay zero (pre-initialized, never written).
+            // frame. It is sized off the engine's configured source count
+            // (numTaps + numInputs); unresolved inputs are silent lanes, so
+            // the layouts match. Guard anyway so the RT write never overruns.
             let monChannels = monRing.channels
 
             // 7. Preallocate scratch + RT context.
@@ -568,17 +583,20 @@ public final class CaptureGraph {
                     ? Int32(layout[bufIdx])
                     : Int32(tapFormats[t].mChannelsPerFrame)
             }
-            let laneCount = numTaps + 1   // input lane slot always allocated
+            let laneCount = max(1, numSources)
             let srcScratch = UnsafeMutablePointer<Float>.allocate(capacity: laneCount * maxFrames * 2)
             srcScratch.initialize(repeating: 0, count: laneCount * maxFrames * 2)
             let busAccum = UnsafeMutablePointer<Float>.allocate(capacity: maxFrames * 2)
             busAccum.initialize(repeating: 0, count: maxFrames * 2)
             let mon = UnsafeMutablePointer<Float>.allocate(capacity: maxFrames * monChannels)
             mon.initialize(repeating: 0, count: maxFrames * monChannels)
+            let monScratch = UnsafeMutablePointer<Float>.allocate(capacity: maxFrames * 2)
+            monScratch.initialize(repeating: 0, count: maxFrames * 2)
 
             func freeScratch() {
                 tapBufIndices.deallocate(); tapChannelsPtr.deallocate()
                 srcScratch.deallocate(); busAccum.deallocate(); mon.deallocate()
+                monScratch.deallocate()
             }
 
             let ctxPtr = UnsafeMutablePointer<CaptureCtx>.allocate(capacity: 1)
@@ -586,12 +604,16 @@ public final class CaptureGraph {
                 numTaps: numTaps,
                 tapBufIndices: tapBufIndices,
                 tapChannels: tapChannelsPtr,
-                inputBufIndex: inputBufIndex,
-                inputChannels: effInputChannels,
+                inputBridges: inputBridges,
+                numInputs: numInputs,
                 numSources: numSources,
+                ioBufferFrames: DeviceUtil.bufferFrameSize(aggregateID),
                 compGain: compGain,
                 gainWords: params.wordsPointer,
                 monitorWord: monitorWord,
+                monitorSlot: monitorSlot,
+                monScratch: monScratch,
+                monitorInputsWord: monitorInputsWord,
                 srcScratch: srcScratch,
                 busAccum: busAccum,
                 mon: mon,
@@ -627,11 +649,12 @@ public final class CaptureGraph {
             }
 
             let graph = CaptureGraph(
-                tapIDs: tapIDs, aggregateID: aggregateID, ioProcID: ioProcID,
+                tapIDs: tapIDs, tapDescriptions: usedDescriptions, tapMuteMask: tapMuteMask,
+                aggregateID: aggregateID, ioProcID: ioProcID,
                 format: tapFormats[0], compGain: compGain, selfExcluded: selfExcluded,
                 ctxPtr: ctxPtr,
                 tapBufIndices: tapBufIndices, tapChannelsPtr: tapChannelsPtr,
-                srcScratch: srcScratch, busAccum: busAccum, mon: mon)
+                srcScratch: srcScratch, busAccum: busAccum, mon: mon, monScratch: monScratch)
             teardownOwns = true
 
             do {
@@ -642,7 +665,8 @@ public final class CaptureGraph {
                 throw error
             }
             let gainDB = 20 * log10(Double(compGain))
-            OALog.info(String(format: "Capture graph: %d tap(s) @ %.0f Hz, %d source(s), comp x%.0f (%+.1f dB)",
+            OALog.info(String(format: "Capture graph: clock '%@' @ %.0f Hz, %d tap(s) (native %.0f Hz), %d source(s), comp x%.0f (%+.1f dB)",
+                              clockDeviceUID, DeviceUtil.nominalSampleRate(aggregateID),
                               numTaps, tapFormats[0].mSampleRate, numSources, compGain, gainDB))
             return graph
         } catch {
@@ -652,6 +676,28 @@ public final class CaptureGraph {
     }
 
     // MARK: Teardown
+
+    /// Live-update which lanes have their direct playback muted while tapped
+    /// (kAudioTapPropertyDescription is settable on an existing tap). Off-RT.
+    public func setTapMuteMask(_ mask: UInt64) {
+        guard !tornDown, mask != tapMuteMask else { return }
+        var addr = CAProperty.address(kAudioTapPropertyDescription)
+        for (t, tapID) in tapIDs.enumerated() where t < tapDescriptions.count {
+            let want = (mask >> UInt64(t)) & 1 != 0
+            let had = (tapMuteMask >> UInt64(t)) & 1 != 0
+            guard want != had else { continue }
+            var desc = tapDescriptions[t]
+            desc.muteBehavior = want ? .mutedWhenTapped : .unmuted
+            let st = withUnsafeMutablePointer(to: &desc) { p in
+                AudioObjectSetPropertyData(tapID, &addr, 0, nil,
+                                           UInt32(MemoryLayout<CATapDescription>.size), p)
+            }
+            if st != noErr {
+                OALog.warn("Lane \(t + 1): could not change tap mute behavior: OSStatus \(osStatusString(st))")
+            }
+        }
+        tapMuteMask = mask
+    }
 
     public func teardown() {
         if tornDown { return }
@@ -675,5 +721,6 @@ public final class CaptureGraph {
         srcScratch.deallocate()
         busAccum.deallocate()
         mon.deallocate()
+        monScratch.deallocate()
     }
 }

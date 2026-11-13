@@ -20,7 +20,6 @@ struct RoutingPane: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            PaneHeader(title: "Routing", systemImage: "point.3.connected.trianglepath.dotted")
             header
             GeometryReader { geo in graph(in: geo.size) }
                 .padding(14)
@@ -77,6 +76,17 @@ struct RoutingPane: View {
                         .frame(width: 120).controlSize(.small)
                     Text(Fmt.dB(model.monitorGainDB)).font(.caption2).monospacedDigit()
                         .foregroundStyle(.secondary).frame(width: 56, alignment: .leading)
+                    if model.inputActive {
+                        Toggle(isOn: Binding(get: { model.monitorIncludesMics },
+                                             set: { model.setMonitorIncludesMics($0) })) {
+                            Label("Mics", systemImage: "mic.fill")
+                        }
+                        .toggleStyle(.button)
+                        .controlSize(.small)
+                        .help("Also hear your microphones in the monitor. Off avoids hearing your own voice " +
+                              "back with a delay, and feedback when the mic and headphones are the same headset. " +
+                              "The OpenAudio devices and recordings always include the mics.")
+                    }
                 }
             }
         }
@@ -184,11 +194,19 @@ struct RoutingPane: View {
                 sourceIcon(src)
                 Text(model.displayName(src)).font(.caption).lineLimit(1)
             }
+            // Gain fader cap (mixer style) riding over the L/R meter.
             StereoMiniMeterView(peakL: meter?.peakL ?? -.infinity,
                                 peakR: meter?.peakR ?? -.infinity,
-                                hold: model.sourceHold(src), width: 92)
+                                hold: model.sourceHold(src), width: 100, barHeight: 8)
+                .overlay {
+                    HFaderOverlay(value: Binding(get: { model.gainDB(src) },
+                                                 set: { model.setGain(src, $0) }),
+                                  range: -40...12)
+                }
+                .help("Gain \(Fmt.dB(model.gainDB(src))) — drag the handle; ⌘-click resets to 0 dB")
         }
         .frame(width: nodeW, height: nodeH)
+        .opacity(model.effectiveMuted(src) ? 0.55 : 1)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06)))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.10)))
     }
@@ -204,7 +222,7 @@ struct RoutingPane: View {
                 Image(systemName: "app.dashed").font(.caption).foregroundStyle(.secondary)
             }
         case .input:
-            Image(systemName: "mic.fill").font(.caption).foregroundStyle(.secondary)
+            Image(systemName: model.symbol(for: src)).font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -218,7 +236,7 @@ struct RoutingPane: View {
                 Text(busName(bus)).font(.caption).lineLimit(1)
             }
             StereoMiniMeterView(peakL: stereo.l, peakR: stereo.r,
-                                hold: model.busHold(bus), width: 92)
+                                hold: model.busHold(bus), width: 100, barHeight: 8)
         }
         .padding(.horizontal, 8)
         .frame(width: nodeW, height: nodeH)
@@ -259,18 +277,44 @@ private struct EdgeShape: Shape {
     }
 }
 
-/// Shared pane header styling.
-struct PaneHeader: View {
-    let title: String
-    let systemImage: String
+/// Horizontal gain fader laid over a meter: the mixer's fader cap, turned
+/// sideways, positioned by dB (linear over `range`). Drag anywhere to set;
+/// ⌘-click resets to 0 dB; snaps to 0 dB when close.
+struct HFaderOverlay: View {
+    @Binding var value: Float
+    let range: ClosedRange<Float>
+    private let capWidth: CGFloat = 12
+
     var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: systemImage).foregroundStyle(.secondary)
-            Text(title).font(.headline)
-            Spacer()
+        GeometryReader { geo in
+            let w = geo.size.width
+            let h = geo.size.height
+            // Absolute placement in the meter's own coordinate space.
+            FaderCap(vertical: false)
+                .frame(width: capWidth, height: h + 6)
+                .position(x: x(for: value, width: w), y: h / 2)
+                .frame(width: w, height: h)
+                .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        if NSEvent.modifierFlags.contains(.command) { value = 0; return }
+                        value = dB(atX: g.location.x, width: w)
+                    }
+            )
         }
-        .padding(.horizontal, 14).padding(.vertical, 10)
-        .background(Color.primary.opacity(0.03))
-        Divider()
+    }
+
+    private func x(for db: Float, width: CGFloat) -> CGFloat {
+        let span = range.upperBound - range.lowerBound
+        let frac = (max(range.lowerBound, min(range.upperBound, db)) - range.lowerBound) / span
+        return CGFloat(frac) * (width - capWidth) + capWidth / 2
+    }
+
+    private func dB(atX xPos: CGFloat, width: CGFloat) -> Float {
+        let usable = max(1, width - capWidth)
+        let frac = Float(min(1, max(0, (xPos - capWidth / 2) / usable)))
+        let db = range.lowerBound + frac * (range.upperBound - range.lowerBound)
+        return abs(db) < 0.5 ? 0 : db
     }
 }

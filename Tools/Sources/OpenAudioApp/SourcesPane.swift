@@ -1,8 +1,9 @@
 // SourcesPane.swift
-// Pane 1 (F-U3 / F-U5): choose capture sources (system audio or specific running
-// applications, plus an optional real input device). Rows show the app icon and
-// a friendly name; user-facing apps sort above daemons. Per-source levels live
-// in the mixer drawer (X key), not here.
+// Pane 1 (F-U3 / F-U5): choose capture sources — any number of microphones /
+// audio interfaces at the top (picked from a multi-select pull-down; each
+// becomes its own mix source), then system audio or specific running apps.
+// Rows show the app icon and a friendly name; user-facing apps sort above
+// daemons. Per-source levels live in the mixer drawer (X key), not here.
 
 import SwiftUI
 import AppKit
@@ -10,16 +11,15 @@ import AppKit
 struct SourcesPane: View {
     @Bindable var model: AppModel
     @State private var search = ""
+    @State private var micPickerShown = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            PaneHeader(title: "Sources", systemImage: "waveform")
-
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    microphones
                     systemToggle
                     processList
-                    inputPicker
                 }
                 .padding(14)
             }
@@ -37,8 +37,6 @@ struct SourcesPane: View {
             }
             .toggleStyle(.switch)
             .disabled(sourcesLocked)
-            Text("Capture everything playing on this Mac. Turn off to pick specific apps below.")
-                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -76,7 +74,7 @@ struct SourcesPane: View {
                 .disabled(model.useSystemAudio || sourcesLocked)
             }
             if selectionAtCap {
-                Text("Up to \(model.maxSelectableApps) apps can be captured at once.")
+                Text("Up to \(model.maxSources) apps and microphones can be mixed at once.")
                     .font(.caption).foregroundStyle(.orange)
             }
         }
@@ -132,25 +130,172 @@ struct SourcesPane: View {
             || ($0.bundleID?.localizedCaseInsensitiveContains(search) ?? false) }
     }
 
-    // MARK: Input device
+    // MARK: Microphones (multi-select input devices)
 
-    private var inputPicker: some View {
+    private var microphones: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Input device").font(.headline)
-            Picker("", selection: Binding(get: { model.inputSelection },
-                                          set: { model.inputSelection = $0 })) {
-                Text("None").tag(InputSelection.none)
-                Text("Default input").tag(InputSelection.systemDefault)
-                ForEach(model.inputDevices, id: \.uid) { dev in
-                    Text(dev.name).tag(InputSelection.device(uid: dev.uid, name: dev.name))
+            HStack {
+                Text("Microphones").font(.headline)
+                Spacer()
+                micPickerButton
+            }
+
+            if !model.selectedInputUIDs.isEmpty {
+                VStack(spacing: 2) {
+                    ForEach(model.selectedInputUIDs, id: \.self) { uid in selectedMicRow(uid) }
+                }
+                .disabled(sourcesLocked)
+            }
+
+            bluetoothNotice
+        }
+    }
+
+    /// Pull-down that stays open so several devices can be ticked in one go.
+    private var micPickerButton: some View {
+        Button {
+            micPickerShown.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "plus")
+                Text(model.selectedInputUIDs.isEmpty ? "Add" : "Edit")
+                Image(systemName: "chevron.down").font(.caption2)
+            }
+        }
+        .controlSize(.small)
+        .disabled(sourcesLocked)
+        .help("Choose input devices to mix (multiple selection)")
+        .popover(isPresented: $micPickerShown, arrowEdge: .bottom) { micPicker }
+    }
+
+    private var micPicker: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Input devices").font(.headline)
+                .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 6)
+            Divider()
+            if model.inputDevices.isEmpty {
+                Text("No input devices found.")
+                    .font(.caption).foregroundStyle(.secondary).padding(12)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(model.inputDevices) { dev in micPickerRow(dev) }
+                }
+                .padding(.vertical, 4)
+            }
+            Divider()
+            Toggle("Keep Mac default input on built-in mic",
+                   isOn: Binding(get: { model.pinDefaultInputToBuiltIn },
+                                 set: { model.setPinDefaultInputToBuiltIn($0) }))
+                .toggleStyle(.checkbox)
+                .font(.caption)
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .help("When a Bluetooth headset connects, macOS makes it the default input; apps using the default mic then turn its playback mono. This switches the default back to the built-in mic.")
+            if model.inputSelectionAtCap {
+                Divider()
+                Text("Up to \(model.maxSources) apps and microphones can be mixed at once.")
+                    .font(.caption).foregroundStyle(.orange)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+            }
+        }
+        .frame(width: 320)
+    }
+
+    private func micPickerRow(_ dev: InputDeviceRow) -> some View {
+        let selected = model.isInputSelected(dev.uid)
+        let selectable = selected || !model.inputSelectionAtCap
+        return Button {
+            model.toggleInput(dev.uid)
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: selected ? "checkmark.square.fill" : "square")
+                    .foregroundStyle(selected ? Color.accentColor : .secondary)
+                Image(systemName: dev.symbol)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 4) {
+                        Text(dev.name).lineLimit(1)
+                        if dev.isSystemDefault { Tag("Default") }
+                    }
+                }
+                Spacer(minLength: 4)
+                Text(dev.rateLabel).font(.caption2).foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+            .padding(.horizontal, 12).padding(.vertical, 5)
+        }
+        .buttonStyle(.plain)
+        .disabled(!selectable)
+        .opacity(selectable ? 1 : 0.4)
+    }
+
+    private func selectedMicRow(_ uid: String) -> some View {
+        let dev = model.inputDevice(uid)
+        let missing = dev == nil
+        return HStack(spacing: 8) {
+            Image(systemName: model.symbol(for: .input(uid)))
+                .foregroundStyle(missing ? Color.secondary : Color.accentColor)
+                .frame(width: 18)
+            Text(model.displayName(.input(uid))).lineLimit(1)
+                .foregroundStyle(missing ? .secondary : .primary)
+            if missing {
+                Text("Not connected").font(.caption2).foregroundStyle(.orange)
+                    .help("This device is unplugged or disconnected. Its channel is silent and resumes automatically when it reconnects.")
+            } else if let dev {
+                if dev.isBluetooth { Tag("Bluetooth") }
+                Text(dev.rateLabel).font(.caption2).foregroundStyle(.tertiary)
+            }
+            Spacer()
+            Button {
+                model.toggleInput(uid)
+            } label: {
+                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("Remove this microphone")
+        }
+        .padding(.vertical, 3)
+    }
+
+    /// Classic Bluetooth cannot carry stereo playback and a microphone at the
+    /// same time: opening the headset's mic switches it to the hands-free
+    /// profile (mono, 16/24 kHz). Say so plainly and offer the one-click fix.
+    @ViewBuilder private var bluetoothNotice: some View {
+        let degrading = model.bluetoothMicsDegradingOutput
+        if let mic = degrading.first {
+            VStack(alignment: .leading, spacing: 6) {
+                Label {
+                    Text("\(mic.name) plays in mono while its mic is in use.")
+                        .font(.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                }
+                if let alt = model.stereoFriendlyMic {
+                    Button("Use \(alt.name) instead (keeps stereo)") {
+                        model.replaceBluetoothMics(with: alt)
+                    }
+                    .controlSize(.small)
+                    .disabled(sourcesLocked)
                 }
             }
-            .labelsHidden()
-            .disabled(sourcesLocked)
-            Text("Optionally mix in a microphone or audio interface.")
-                .font(.caption).foregroundStyle(.secondary)
+            .padding(8)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.10)))
         }
     }
 
     private var sourcesLocked: Bool { model.isRecording }
+}
+
+/// Small capsule label ("Default", "Bluetooth").
+private struct Tag: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+    var body: some View {
+        Text(text)
+            .font(.caption2)
+            .padding(.horizontal, 5).padding(.vertical, 1)
+            .background(Capsule().fill(Color.primary.opacity(0.08)))
+            .foregroundStyle(.secondary)
+    }
 }

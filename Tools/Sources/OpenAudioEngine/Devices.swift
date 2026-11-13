@@ -13,6 +13,13 @@ public struct AudioDeviceInfo {
     public var inChannels: Int
     public var outChannels: Int
     public var sampleRate: Double
+    /// kAudioDevicePropertyTransportType ('blue', 'blea', 'bltn', ...).
+    public var transportType: UInt32
+
+    /// Classic or LE Bluetooth. Opening a classic Bluetooth headset's mic
+    /// switches the headset to its hands-free profile (mono, 16/24 kHz) for
+    /// both directions until the mic is released — an OS / Bluetooth limit.
+    public var isBluetooth: Bool { DeviceUtil.isBluetooth(transportType: transportType) }
 }
 
 public enum DeviceUtil {
@@ -59,6 +66,24 @@ public enum DeviceUtil {
         return Int(v)
     }
 
+    public static func transportType(_ device: AudioObjectID) -> UInt32 {
+        (try? CAProperty.scalar(device, kAudioDevicePropertyTransportType, default: UInt32(0))) ?? 0
+    }
+
+    public static func isBluetooth(transportType t: UInt32) -> Bool {
+        t == kAudioDeviceTransportTypeBluetooth || t == kAudioDeviceTransportTypeBluetoothLE
+    }
+
+    /// Classic Bluetooth exposes one headset as ":input" / ":output" devices
+    /// whose UIDs share an address-based stem.
+    public static func sameBluetoothHeadset(_ a: String, _ b: String) -> Bool {
+        func stem(_ s: String) -> Substring {
+            guard let i = s.lastIndex(of: ":") else { return Substring(s) }
+            return s[..<i]
+        }
+        return !stem(a).isEmpty && stem(a) == stem(b)
+    }
+
     public static func uid(_ device: AudioObjectID) -> String {
         (try? CAProperty.string(device, kAudioDevicePropertyDeviceUID)) ?? ""
     }
@@ -73,6 +98,15 @@ public enum DeviceUtil {
 
     public static func defaultInputDevice() -> AudioObjectID {
         (try? CAProperty.scalar(system, kAudioHardwarePropertyDefaultInputDevice, default: AudioObjectID(0))) ?? 0
+    }
+
+    /// Set the system default input device. Off-RT.
+    @discardableResult
+    public static func setDefaultInputDevice(_ device: AudioObjectID) -> Bool {
+        var addr = CAProperty.address(kAudioHardwarePropertyDefaultInputDevice)
+        var id = device
+        return AudioObjectSetPropertyData(system, &addr, 0, nil,
+                                          UInt32(MemoryLayout<AudioObjectID>.size), &id) == noErr
     }
 
     /// Resolve a device UID to its AudioObjectID (0 if not found).
@@ -97,7 +131,8 @@ public enum DeviceUtil {
                 name: name(id),
                 inChannels: channelCount(id, scope: kAudioObjectPropertyScopeInput),
                 outChannels: channelCount(id, scope: kAudioObjectPropertyScopeOutput),
-                sampleRate: nominalSampleRate(id))
+                sampleRate: nominalSampleRate(id),
+                transportType: transportType(id))
         }
     }
 }

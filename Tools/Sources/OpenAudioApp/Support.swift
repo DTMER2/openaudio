@@ -7,13 +7,14 @@ import CoreAudio
 
 // MARK: - Source / routing model
 
-/// A UI-facing mix source: the system-wide tap, one tapped app, or the input
-/// device. Mapped onto engine tap lanes (OpenAudioEngine.EngineSource) by
-/// AppModel using the lane order of the running engine.
+/// A UI-facing mix source: the system-wide tap, one tapped app, or one input
+/// device (microphone / interface, keyed by device UID). Mapped onto engine
+/// lanes (OpenAudioEngine.EngineSource) by AppModel using the lane order of
+/// the running engine.
 enum SourceKind: Hashable {
     case system
     case app(pid_t)
-    case input
+    case input(String)
 }
 
 /// A single (source, bus) routing cell. Bus index is 0-based.
@@ -29,29 +30,27 @@ struct AppLaneParams: Hashable {
     var muted = false
 }
 
-/// Real input-device selection for the optional microphone / interface lane.
-enum InputSelection: Hashable {
-    case none
-    case systemDefault
-    case device(uid: String, name: String)
+/// A selectable real input device (microphone / audio interface).
+struct InputDeviceRow: Identifiable, Hashable {
+    var id: String { uid }
+    var deviceID: AudioObjectID
+    var uid: String
+    var name: String
+    var channels: Int
+    var sampleRate: Double
+    var isBluetooth: Bool
+    var isBuiltIn: Bool
+    /// The system's current default input.
+    var isSystemDefault: Bool
 
-    /// The value handed to EngineConfig.inputDeviceUID (nil == no input lane).
-    var configUID: String? {
-        switch self {
-        case .none:           return nil
-        case .systemDefault:  return "default"
-        case .device(let u, _): return u
-        }
-    }
+    /// SF Symbol for the device kind.
+    var symbol: String { isBluetooth ? "headphones" : "mic.fill" }
 
-    var isActive: Bool { configUID != nil }
-
-    var label: String {
-        switch self {
-        case .none:           return "None"
-        case .systemDefault:  return "Default input"
-        case .device(_, let n): return n
-        }
+    /// "48 kHz" / "44.1 kHz" / "24 kHz".
+    var rateLabel: String {
+        guard sampleRate > 0 else { return "" }
+        let k = sampleRate / 1000
+        return k == k.rounded() ? String(format: "%.0f kHz", k) : String(format: "%.1f kHz", k)
     }
 }
 

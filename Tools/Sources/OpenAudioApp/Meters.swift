@@ -69,9 +69,10 @@ struct StereoMiniMeterView: View {
     var peakR: Float
     var hold: PeakHold = PeakHold()
     var width: CGFloat = 92
+    var barHeight: CGFloat = 5
 
     var body: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: barHeight > 5 ? 3 : 2) {
             bar(peak: peakL, hold: hold.l)
             bar(peak: peakR, hold: hold.r)
         }
@@ -94,7 +95,7 @@ struct StereoMiniMeterView: View {
                     .opacity(hold.isFinite ? 1 : 0)
             }
         }
-        .frame(height: 5)
+        .frame(height: barHeight)
     }
 }
 

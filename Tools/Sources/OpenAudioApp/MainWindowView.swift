@@ -48,6 +48,12 @@ struct MainWindowView: View {
         .onAppear {
             model.setWindowVisible(true)
             installKeyMonitor()
+            // SwiftUI focuses the first text field (app search) when the window
+            // opens, which would swallow the bare-X mixer shortcut. Start with
+            // nothing focused; clicking a field still focuses it as usual.
+            DispatchQueue.main.async {
+                for w in NSApp.windows where w.firstResponder is NSText { w.makeFirstResponder(nil) }
+            }
         }
         .onDisappear {
             model.setWindowVisible(false)
@@ -58,11 +64,18 @@ struct MainWindowView: View {
     /// Logic-style bare-key shortcut: X toggles the mixer drawer. Implemented
     /// as a local event monitor (not a menu key equivalent) so typing "x" in
     /// the search field / dB fields keeps working — text editing is detected
-    /// via the field editor being first responder.
+    /// via the field editor being first responder. Matched by physical key
+    /// (kVK_ANSI_X) so it also works with a Japanese / non-Latin input source.
     private func installKeyMonitor() {
         guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard event.charactersIgnoringModifiers?.lowercased() == "x",
+            // Esc leaves a text field, so the bare-key shortcut works again.
+            if event.keyCode == 53, let w = event.window, w.firstResponder is NSText {   // kVK_Escape
+                w.makeFirstResponder(nil)
+                return nil
+            }
+            guard event.keyCode == 7,   // kVK_ANSI_X
+                  !event.isARepeat,
                   event.modifierFlags.intersection([.command, .option, .control]).isEmpty,
                   let window = event.window, window.isKeyWindow,
                   !(window.firstResponder is NSText)

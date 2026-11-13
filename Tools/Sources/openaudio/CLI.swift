@@ -12,7 +12,7 @@ struct RouteSpec {
 struct RunOptions {
     var tapSystem = false
     var tapPIDs: [pid_t] = []
-    var inputSpec: String?        // "default" or a device UID
+    var inputSpecs: [String] = [] // "default" or device UIDs (repeatable)
     var tapGainDB: Float = 0
     var inputGainDB: Float = 0
     var tapPan: Float = 0
@@ -25,6 +25,7 @@ struct RunOptions {
     var routes: [RouteSpec] = []  // empty => all sources -> bus 1
     var monitorBus: Int?          // 0-based; nil => monitoring off
     var monitorGainDB: Float = 0
+    var monitorInputs = false     // hear the --input lanes in the monitor too
 }
 
 enum ParsedCommand {
@@ -41,7 +42,7 @@ enum CLI {
     openaudio — Phase 1 engine: capture (tap + optional input) -> mix -> clock bridge -> virtual device
 
     USAGE:
-      openaudio run (--tap-pid <pid>... | --tap-system) [--input default|<uid>]
+      openaudio run (--tap-pid <pid>... | --tap-system) [--input default|<uid>]...
                     [--buses N] [--route <src>=<bus[,bus...]>]...
                     [--gain tap=<dB>] [--gain input=<dB>] [--pan tap=<-1..1>]
                     [--record <out.caf>] [--duration <sec>] [--stats-interval <sec>]
@@ -65,7 +66,8 @@ enum CLI {
     RUN OPTIONS:
       --tap-pid <pid>       Tap this process output (repeatable).
       --tap-system          Tap all system output.
-      --input default|<uid> Add a real input device as a source (drift-compensated in-aggregate).
+      --input default|<uid> Add a real input device as a source (own IOProc, resampled to
+                            the capture rate). Repeatable: one lane per device.
       --buses N             Attach buses 1..N (virtual devices OpenAudioDevice-1..N). Default 1.
       --single-device       16ch pair-packed mode: all buses land on OpenAudioDevice-1,
                             bus n on channels (2n-1)/(2n) — record every bus in a DAW
@@ -73,10 +75,12 @@ enum CLI {
       --route <src>=<b,..>  Route source (tap|input) to 1-based bus indices. Repeatable.
                             Default (no --route): all sources -> bus 1.
       --gain tap=<dB>       Tap gain in dB (default 0).
-      --gain input=<dB>     Input gain in dB (default 0).
+      --gain input=<dB>     Gain in dB for every input lane (default 0).
       --pan tap=<-1..1>     Tap stereo balance (equal-power), -1 L .. +1 R.
       --monitor <bus>       Pass bus (1-based) through to the default output for monitoring.
       --monitor-gain <dB>   Monitor gain in dB (default 0). Applies to the monitor path only.
+      --monitor-inputs      Also hear the --input lanes in the monitor (off by default to
+                            avoid self-echo / feedback; buses and recordings include them).
       --record <out.caf>    Record the full (pre-routing) stereo mix to a CAF file.
       --duration <sec>      Stop automatically after N seconds (default: until Ctrl-C).
       --stats-interval <s>  Stats print interval (default 2).
@@ -139,7 +143,7 @@ enum CLI {
             case "--input":
                 i += 1
                 guard i < args.count else { throw CLIError("--input requires 'default' or a device UID") }
-                o.inputSpec = args[i]
+                o.inputSpecs.append(args[i])
             case "--buses":
                 i += 1
                 guard i < args.count, let n = Int(args[i]), n >= 1, n <= 8 else {
@@ -187,6 +191,8 @@ enum CLI {
                     throw CLIError("--monitor requires a 1-based bus index 1..8")
                 }
                 o.monitorBus = b - 1   // to 0-based
+            case "--monitor-inputs":
+                o.monitorInputs = true
             case "--monitor-gain":
                 i += 1
                 guard i < args.count, let db = Float(args[i]) else {

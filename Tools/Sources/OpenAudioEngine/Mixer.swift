@@ -3,8 +3,8 @@
 // capture callback as packed 64-bit words: each source's effective (L, R)
 // linear gain pair is precomputed off-RT and published as ONE atomic 64-bit
 // word, so the RT reader can never observe a torn pair — a single aligned
-// 64-bit load is atomic on arm64/x86_64. (Tap and input words are separate;
-// a momentary old-tap/new-input combination across a simultaneous update is
+// 64-bit load is atomic on arm64/x86_64. (Each lane's word is separate; a
+// momentary old/new combination across lanes during a simultaneous update is
 // benign for gains.) Setters run off the RT thread, serialized by the caller.
 
 import Foundation
@@ -47,25 +47,30 @@ public func unpackMonitor(_ w: UInt64) -> (Int32, Float) {
 
 /// Publishes effective per-source (L, R) gains as atomic packed words.
 /// Sources are N tap lanes (one per tapped app, or one for the system tap)
-/// followed by the optional input device; the input word always lives at index
-/// `tapCount` so the RT context can index lanes without conditionals.
+/// followed by M input-device lanes (microphones / interfaces); input lane j
+/// lives at word index `tapCount + j` so the RT context indexes lanes without
+/// conditionals.
 public final class MixParamsStore: @unchecked Sendable {
     public let tapCount: Int
+    public let inputCount: Int
 
     // Off-RT authoritative source parameters.
     public var taps: [SourceParams]
-    public var input = SourceParams()
+    public var inputs: [SourceParams]
 
-    // Contiguous packed (L,R) gain words: 0..<tapCount taps, tapCount = input.
+    // Contiguous packed (L,R) gain words: 0..<tapCount taps, then inputs.
     // Each is an aligned 64-bit word, so a plain load/store is never torn on
     // arm64/x86_64 (same discipline as Atomic64).
     private let words: UnsafeMutablePointer<UInt64>
 
-    public init(tapCount: Int) {
+    public init(tapCount: Int, inputCount: Int) {
         self.tapCount = max(0, tapCount)
+        self.inputCount = max(0, inputCount)
         self.taps = Array(repeating: SourceParams(), count: self.tapCount)
-        self.words = UnsafeMutablePointer<UInt64>.allocate(capacity: self.tapCount + 1)
-        self.words.initialize(repeating: packGainPair(1, 1), count: self.tapCount + 1)
+        self.inputs = Array(repeating: SourceParams(), count: self.inputCount)
+        let n = max(1, self.tapCount + self.inputCount)
+        self.words = UnsafeMutablePointer<UInt64>.allocate(capacity: n)
+        self.words.initialize(repeating: packGainPair(1, 1), count: n)
         publish()
     }
 
@@ -81,8 +86,10 @@ public final class MixParamsStore: @unchecked Sendable {
             let (l, r) = Self.lr(taps[i])
             words[i] = packGainPair(l, r)
         }
-        let (il, ir) = Self.lr(input)
-        words[tapCount] = packGainPair(il, ir)
+        for j in 0..<inputCount {
+            let (l, r) = Self.lr(inputs[j])
+            words[tapCount + j] = packGainPair(l, r)
+        }
         OSMemoryBarrier()
     }
 
